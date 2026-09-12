@@ -405,3 +405,56 @@ CREATE TABLE IF NOT EXISTS portfolio_reports (
     report_json     JSONB NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ============================================================================
+-- Fase 4 (spec del usuario) — Paper trading simulado sobre la última semana
+-- completa de datos disponibles. Ver pipeline/paper_trading/simulator.py.
+--
+-- DIFERENCIAS DELIBERADAS frente a portfolio_trades (documentadas, no un
+-- descuido): sin dólares (el spec de paper trading no pide sizing ni P&L en
+-- $, solo pnl_pct — igual que el dashboard de la Fase 1 ya usaba
+-- cumulative_return_pct, no balance), sin trailing-stop de Aggressive (el
+-- log del spec no tiene campo para cierres parciales, solo un status
+-- OPEN/CLOSED_TP/CLOSED_SL/CLOSED_TIMEOUT de una sola pieza), y con estado
+-- OPEN real y persistente: a diferencia del backtest histórico (que fuerza
+-- el cierre de todo lo que quede abierto al final de los datos), aquí una
+-- posición sin TP/SL/timeout resuelto dentro de los datos de precio
+-- disponibles hasta hoy se queda OPEN — es correcto, no un bug: significa
+-- "todavía no lo sabemos". Volver a correr el simulador con más días de
+-- precio ya cargados resuelve la posición de forma natural (ON CONFLICT
+-- DO UPDATE), sin necesitar un mecanismo de estado incremental aparte.
+CREATE TABLE IF NOT EXISTS paper_trades (
+    trade_id        SERIAL PRIMARY KEY,
+    run_batch_tag   TEXT NOT NULL,
+    week_start      DATE NOT NULL,
+    week_end        DATE NOT NULL,
+    event_id        INT NOT NULL REFERENCES events(event_id),
+    version         TEXT NOT NULL CHECK (version IN ('CONSERVATIVE', 'AGGRESSIVE', 'BALANCED')),
+    direction       TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+    entry_date      DATE NOT NULL,
+    entry_price     NUMERIC NOT NULL,
+    exit_date       DATE,
+    exit_price      NUMERIC,
+    exit_reason     TEXT CHECK (exit_reason IN ('TAKE_PROFIT', 'STOP_LOSS', 'TIMEOUT')),
+    status          TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED_TP', 'CLOSED_SL', 'CLOSED_TIMEOUT')),
+    pnl_pct         NUMERIC,
+    confidence      NUMERIC NOT NULL,
+    ev              NUMERIC NOT NULL,
+    prediction      NUMERIC NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_paper_no_lookahead CHECK (exit_date IS NULL OR exit_date > entry_date),
+    UNIQUE (event_id, version, run_batch_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_version_tag ON paper_trades (version, run_batch_tag);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades (status);
+
+-- paper_trading_reports: mismo patrón que portfolio_reports — el reporte
+-- semanal completo (log, comparación predicción-vs-real, calibración de la
+-- semana, alerts) como JSON, para que el dashboard no reimplemente nada.
+CREATE TABLE IF NOT EXISTS paper_trading_reports (
+    run_batch_tag   TEXT PRIMARY KEY,
+    week_start      DATE NOT NULL,
+    week_end        DATE NOT NULL,
+    report_json     JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

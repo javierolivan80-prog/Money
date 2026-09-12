@@ -9,6 +9,7 @@ import pytest
 from pipeline.backtest.portfolio_metrics import (
     CALIBRATION_TARGET,
     INSUFFICIENT_SAMPLE_THRESHOLD,
+    bucket_by_confidence,
     compute_asymmetry_report,
     compute_calibration,
     compute_equity_metrics,
@@ -302,3 +303,86 @@ def test_bias_report_against_real_postgres():
     assert report["n_price_rows"] == 10
     assert report["data_gap_pct"] == pytest.approx(20.0)
     conn.close()
+
+
+# ============================================================================
+# bucket_by_confidence — compartido entre el dashboard (Fase 5) y
+# paper_trading (Fase 4).
+# ============================================================================
+
+def test_bucket_by_confidence_hand_calculated():
+    records = [
+        {"confidence": 95, "won": True},
+        {"confidence": 92, "won": False},
+        {"confidence": 85, "won": True},
+        {"confidence": 55, "won": False},
+        {"confidence": 51, "won": False},
+    ]
+    buckets = bucket_by_confidence(records, "confidence", "won", edges=(50.0, 60.0, 70.0, 80.0, 90.0, 100.0))
+    by_label = {b["bucket"]: b for b in buckets}
+
+    assert by_label["90-100"]["n"] == 2
+    assert by_label["90-100"]["hit_rate"] == pytest.approx(0.5)  # 1 de 2
+    assert by_label["80-90"]["n"] == 1
+    assert by_label["80-90"]["hit_rate"] == pytest.approx(1.0)
+    assert by_label["50-60"]["n"] == 2
+    assert by_label["50-60"]["hit_rate"] == pytest.approx(0.0)
+    assert "60-70" not in by_label  # banda vacía, no aparece
+    assert "70-80" not in by_label
+
+
+def test_bucket_by_confidence_100_falls_in_last_bucket_inclusive():
+    records = [{"confidence": 100.0, "won": True}]
+    buckets = bucket_by_confidence(records, "confidence", "won")
+    assert len(buckets) == 1
+    assert buckets[0]["bucket"] == "90-100"
+    assert buckets[0]["n"] == 1
+
+
+def test_bucket_by_confidence_empty_input_returns_empty_list():
+    assert bucket_by_confidence([], "confidence", "won") == []
+
+
+# ============================================================================
+# compute_calibration_diagnostics — correlación, Brier score, ECE.
+# ============================================================================
+
+def test_calibration_diagnostics_hand_calculated():
+    from pipeline.backtest.portfolio_metrics import compute_calibration_diagnostics
+
+    records = [
+        {"confidence": 100, "correct": True},
+        {"confidence": 100, "correct": True},
+        {"confidence": 50, "correct": False},
+        {"confidence": 50, "correct": False},
+    ]
+    diag = compute_calibration_diagnostics(records, "confidence", "correct")
+    assert diag["n"] == 4
+    assert diag["correlation"] == pytest.approx(1.0)
+    assert diag["brier_score"] == pytest.approx(0.125)
+    assert diag["ece"] == pytest.approx(0.25)
+
+
+def test_calibration_diagnostics_constant_confidence_gives_none_correlation():
+    from pipeline.backtest.portfolio_metrics import compute_calibration_diagnostics
+
+    records = [{"confidence": 80, "correct": True}, {"confidence": 80, "correct": False}]
+    diag = compute_calibration_diagnostics(records, "confidence", "correct")
+    assert diag["correlation"] is None  # sin varianza en confidence, indefinido, no 0
+    assert diag["brier_score"] is not None
+
+
+def test_calibration_diagnostics_fewer_than_2_records_returns_none():
+    from pipeline.backtest.portfolio_metrics import compute_calibration_diagnostics
+
+    diag = compute_calibration_diagnostics([{"confidence": 80, "correct": True}], "confidence", "correct")
+    assert diag["n"] == 1
+    assert diag["correlation"] is None
+    assert diag["brier_score"] is None
+    assert diag["ece"] is None
+
+
+def test_bucket_by_confidence_reports_mean_confidence_per_bucket():
+    records = [{"confidence": 91, "won": True}, {"confidence": 99, "won": True}]
+    buckets = bucket_by_confidence(records, "confidence", "won")
+    assert buckets[0]["mean_confidence"] == pytest.approx(95.0)

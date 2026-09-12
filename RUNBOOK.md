@@ -22,8 +22,9 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los **229 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
-  Fase 3 + 81 Fase 4/backtest de cartera), incluyendo decenas contra un
+- Los **259 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
+  Fase 3 + 81 backtest de cartera + 30 paper trading), incluyendo decenas
+  contra un
   **Postgres 16 real** levantado en este sandbox (no un mock) — schema,
   upserts idempotentes, CHECK constraints anti-look-ahead, detección de gaps
   de supervivencia, la caché de 24h de Bull/Bear/Judge, el filtro
@@ -308,6 +309,65 @@ detalle** — ver las cabeceras de módulo para el razonamiento completo:
 - `portfolio_metrics.py`: la fórmula de calibración es literal del spec
   (`1 - |predicho-real|/|predicho|`) y puede salir fuera de [0,1] — no se
   recorta, se reporta tal cual.
+
+### 3.10 Paper trading simulado (spec "Fase 4 — Paper Trading simulado")
+
+Simula la ÚLTIMA SEMANA COMPLETA (lunes-viernes) de datos disponibles como si
+fuera "futura": entrada D+1, hold hasta TP/SL o fin de semana, log con status
+`OPEN`/`CLOSED_TP`/`CLOSED_SL`/`CLOSED_TIMEOUT` (tabla `paper_trades`), más
+la comparación predicción-vs-real para TODOS los eventos de la semana (con o
+sin trade_decision) y las alerts del spec. Requiere lo mismo que §3.9
+(`event_analyses` con trade_decision, precios con `open_raw`):
+
+```bash
+python -m pipeline.paper_trading.report
+```
+
+Guarda el reporte completo en `paper_trading_reports` (JSONB), mismo patrón
+que `portfolio_reports` — el dashboard lee de ahí, no recalcula nada.
+
+**Estado OPEN de verdad, no un placeholder**: a diferencia del backtest
+histórico (que fuerza el cierre de todo al final del panel de precios,
+porque ahí termina "la historia"), aquí una posición sin TP/SL disparado y
+sin datos de precio todavía hasta el fin de semana simulada se queda
+`OPEN` — es la respuesta correcta ("todavía no lo sabemos"), no un caso sin
+cubrir. Volver a correr el mismo comando más tarde (con más días de precio
+ya cargados) resuelve la posición de forma natural, porque el
+`run_batch_tag` se deriva de la SEMANA simulada (`paper-week-{lunes}`), no
+de la fecha de hoy — así el pipeline nocturno actualiza las MISMAS filas
+noche tras noche en vez de dejar huérfanas las posiciones `OPEN` de ayer
+bajo un tag distinto (bug real que se detectó y corrigió en esta sesión
+antes de conectar el paso a `nightly_pipeline.yml` — ver el historial de
+`paper_trading/report.py`).
+
+**Ambigüedades del spec, resueltas y documentadas en el código**:
+- `paper_trading/simulator.py`: sin los tramos de trailing-stop de
+  Aggressive (el log del spec es de una sola pieza) — se usa el primer
+  umbral del trailing real (+20%) como take-profit único estand-in, solo
+  para esta simulación de una semana (el backtest histórico de §3.9 sigue
+  usando los tramos reales). Sin sizing en dólares (el spec no lo pide,
+  solo `pnl_pct`) — se reutiliza la misma comisión de 10 bps del backtest
+  histórico para que la comparación "¿el paper trading confirma el
+  backtest?" sea consistente.
+- `paper_trading/analysis.py`: el spec ilustra `predicted_magnitude` con
+  una escala grande ("predice +40%, sube +38%") que no corresponde a
+  `ev_conservative/aggressive/balanced` (0.2%-2%, un valor esperado
+  ajustado por probabilidad, no un pronóstico de movimiento) sino más bien
+  a `impact_estimation.expected_magnitude_pct` (Etapa 6) — que solo se
+  persiste como texto formateado dentro de un JSONB, no como número
+  consultable. Se usa `ev_{version}*100` como predicted_magnitude, la MISMA
+  definición que ya usa `portfolio_metrics.compute_calibration` (Fase 3),
+  para que "calibración" signifique lo mismo en todo el proyecto — y se
+  recalibran los umbrales de los alerts a esta escala real, no a los
+  "+40%" ilustrativos del spec.
+- `calibration_score` en esta fase es una CORRELACIÓN(confidence, accuracy)
+  — literal del spec de Fase 4 — DISTINTA de la fórmula de calibración de
+  la Fase 3 (`1-|predicho-real|/|predicho|`, en `portfolio_metrics.compute_calibration`).
+  Son dos métricas con el mismo nombre en dos specs distintos del usuario:
+  se implementan ambas, cada una donde su spec la pidió, sin intentar
+  unificarlas — ver `compute_calibration_diagnostics` (correlación + Brier
+  + ECE, compartida entre esta fase y el dashboard) vs `compute_calibration`
+  (la fórmula de razón de la Fase 3).
 
 ## 4. Desplegar el dashboard
 

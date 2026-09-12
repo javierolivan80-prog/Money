@@ -130,6 +130,20 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.backtest.portfolio_report
 
+      - name: Paper trading semanal (Fase 4 — paper_trading/report.py)
+        # Simula la última semana COMPLETA de datos disponibles como si
+        # fuera "futura" (select_simulation_week en paper_trading/simulator.py).
+        # A diferencia del backtest de cartera, esto SÍ tiene estado
+        # incremental real: una posición sin resolver queda OPEN y se
+        # recalcula (y puede cerrarse) la próxima vez que corra este mismo
+        # step con más días de precio ya cargados — por eso corre cada
+        # noche con el MISMO run_batch_tag por semana simulada, no uno
+        # nuevo cada día (ver select_simulation_week: la fecha de hoy
+        # decide la semana, no el run_batch_tag).
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.paper_trading.report
+
   # El backfill de precios (yfinance) va en un job SEPARADO, manual, no en el
   # cron nocturno normal: es la etapa lenta y frágil (ARCHITECTURE_LEAN.md §7)
   # y solo hace falta ejecutarla una vez para el histórico, más incrementos

@@ -298,3 +298,104 @@ def compute_prediction_regression(trades: list[dict]) -> dict:
 def top_n_trades(trades: list[dict], n: int = 10, winners: bool = True) -> list[dict]:
     """Top N ganadores o perdedores por pnl_pct — para las tablas de salida."""
     return sorted(trades, key=lambda t: float(t["pnl_pct"]), reverse=winners)[:n]
+
+
+# ============================================================================
+# Bucketing por confidence — compartido entre el dashboard (Fase 5, TAB 2
+# "Win rate by confidence bucket") y paper_trading (Fase 4, "Hit rate por
+# rango de confidence"): misma operación (partir en bandas de confidence y
+# promediar un resultado booleano), dos "outcome" distintos (pnl_pct>0 para
+# el backtest, was_correct para paper trading) — parametrizado en vez de
+# duplicado.
+# ============================================================================
+
+DEFAULT_CONFIDENCE_BUCKET_EDGES = (50.0, 60.0, 70.0, 80.0, 90.0, 100.0)
+
+
+def bucket_by_confidence(
+    records: list[dict],
+    confidence_key: str,
+    outcome_key: str,
+    edges: tuple[float, ...] = DEFAULT_CONFIDENCE_BUCKET_EDGES,
+) -> list[dict]:
+    """records: dicts con al menos confidence_key (0-100) y outcome_key
+    (booleano, o algo truthy/falsy — ej. pnl_pct>0 ya evaluado por el
+    caller, o was_correct). edges define los límites de banda INCLUSIVOS
+    por abajo, EXCLUSIVOS por arriba salvo el último borde (100 incluido).
+    Buckets sin ningún record no aparecen en el resultado (no se rellenan
+    con n=0 — no hay nada que decir de una banda vacía)."""
+    buckets: dict[tuple[float, float], list[bool]] = {}
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        buckets[(lo, hi)] = []
+
+    grouped: dict[tuple[float, float], list[tuple[float, bool]]] = {k: [] for k in buckets}
+    for r in records:
+        c = float(r[confidence_key])
+        for lo, hi in grouped:
+            is_last = hi == edges[-1]
+            if lo <= c < hi or (is_last and c == hi):
+                grouped[(lo, hi)].append((c, bool(r[outcome_key])))
+                break
+
+    result = []
+    for (lo, hi), pairs in grouped.items():
+        if not pairs:
+            continue
+        confidences = [c for c, _ in pairs]
+        outcomes = [o for _, o in pairs]
+        result.append(
+            {
+                "bucket": f"{lo:.0f}-{hi:.0f}",
+                "confidence_min": lo,
+                "confidence_max": hi,
+                "n": len(outcomes),
+                "hit_rate": sum(outcomes) / len(outcomes),
+                "mean_confidence": sum(confidences) / len(confidences),
+            }
+        )
+    return sorted(result, key=lambda b: b["confidence_min"])
+
+
+def compute_calibration_diagnostics(
+    records: list[dict],
+    confidence_key: str,
+    outcome_key: str,
+    edges: tuple[float, ...] = DEFAULT_CONFIDENCE_BUCKET_EDGES,
+) -> dict:
+    """Diagnóstico de calibración genérico, compartido entre paper_trading
+    (Fase 4 — calibration_score = correlación(confidence, accuracy), literal
+    del spec) y el dashboard (Fase 5, TAB 3: curva de calibración, Brier
+    score, ECE). confidence_key en escala 0-100; se normaliza a [0,1]
+    internamente para Brier/ECE (que son fracciones de probabilidad por
+    definición), no para el bucketing (que sigue en escala 0-100, igual que
+    bucket_by_confidence).
+
+    - correlation: Pearson entre confidence (0-100) y outcome (0/1). None si
+      hay <2 registros o si confidence u outcome no varían (correlación
+      indefinida, no 0 — 0 significaría "sin relación", no "no calculable").
+    - brier_score: mean((confidence/100 - outcome)^2). 0 = perfecto, 0.25 =
+      el score de "siempre predecir 50%" (referencia estándar).
+    - ece: Expected Calibration Error = sum_b (n_b/N) * |hit_rate_b -
+      mean_confidence_b/100| sobre los buckets no vacíos de
+      bucket_by_confidence — la definición estándar (Guo et al. 2017),
+      pesada por tamaño de bucket para no dejar que un bucket con 2 eventos
+      pese igual que uno con 200."""
+    n = len(records)
+    if n < 2:
+        return {"n": n, "correlation": None, "brier_score": None, "ece": None, "buckets": []}
+
+    confidences = [float(r[confidence_key]) for r in records]
+    outcomes = [1.0 if r[outcome_key] else 0.0 for r in records]
+
+    conf_arr = np.array(confidences)
+    out_arr = np.array(outcomes)
+    correlation = None
+    if conf_arr.std() > 0 and out_arr.std() > 0:
+        correlation = float(np.corrcoef(conf_arr, out_arr)[0, 1])
+
+    brier_score = float(np.mean(((conf_arr / 100.0) - out_arr) ** 2))
+
+    buckets = bucket_by_confidence(records, confidence_key, outcome_key, edges)
+    ece = sum((b["n"] / n) * abs(b["hit_rate"] - b["mean_confidence"] / 100.0) for b in buckets) if buckets else None
+
+    return {"n": n, "correlation": correlation, "brier_score": brier_score, "ece": ece, "buckets": buckets}
