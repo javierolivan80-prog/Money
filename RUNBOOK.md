@@ -22,9 +22,9 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los **259 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
-  Fase 3 + 81 backtest de cartera + 30 paper trading), incluyendo decenas
-  contra un
+- Los **288 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
+  Fase 3 + 81 backtest de cartera + 30 paper trading + 2 regresión Fase 5 +
+  27 Fase 6/validación estadística), incluyendo decenas contra un
   **Postgres 16 real** levantado en este sandbox (no un mock) — schema,
   upserts idempotentes, CHECK constraints anti-look-ahead, detección de gaps
   de supervivencia, la caché de 24h de Bull/Bear/Judge, el filtro
@@ -450,6 +450,63 @@ precios posteriores a D0"), con test de regresión en
 correspondientes (`getStrategySummaries`, `getEquityCurve`, `getTrades`,
 `getLatestRunBatchTag`) también se eliminaron de `lib/queries.ts`.
 
+### 3.12 Validación estadística final — Fase 6 ("Validación + Recomendación de inversión")
+
+Ensambla TODO lo anterior (event study, backtest, calibración,
+sensibilidad, sesgos) en un único documento de decisión — el último paso
+del spec del usuario, "¿invertir dinero real?". Nuevo paquete
+`pipeline/validation/`:
+
+- `event_study.py` (PARTE 1): estadísticos por `event_class` sobre
+  `car_results` (no sobre los trades del backtest — es la pregunta "¿existe
+  un edge?", con n en la escala de todos los eventos, ver
+  `AUDIT_LEAN.md` §2.2.3). MDE = 2.8·σ/√n, la MISMA fórmula y constante que
+  ya usó el propio audit — no se reinventa. t-test de una muestra (scipy)
+  contra H0: retorno medio = 0.
+- `sensitivity.py` (PARTE 5): 5 escenarios — comisión +0.1%, spread +0.2%,
+  latencia D+2 (aproximado: reprecia la entrada contra el MISMO exit ya
+  registrado, no resimula el día a día completo — ver el docstring del
+  módulo para por qué esto basta para la pregunta que responde esta
+  sección), confidence -20% (reutiliza el piso de confidence real de
+  `abstention_engine.py`, no un umbral inventado), y régimen alto/bajo VIX
+  en la entrada (proxy de la varianza YA OBSERVADA en vez de una
+  resimulación estocástica bajo un choque hipotético de +50% — este
+  proyecto no tiene un modelo de precios). La misma tabla alto/bajo VIX
+  responde a la vez la pregunta de "regime dependency" de PARTE 4.
+- `decision.py` (PARTE 6): las 3 opciones literales del spec
+  (GREENLIGHT/YELLOWLIGHT/REDLIGHT) con los umbrales EXACTOS que da —
+  distintos de los umbrales de `portfolio_report.py:generate_recommendation`
+  (Fase 3), que responde una pregunta más laxa ("¿esta corrida en concreto
+  se ve bien?") con otros números. Una violación anti-look-ahead es
+  bloqueante por sí sola, sin importar qué tan bien salga el resto.
+- `report.py`: ensambla las 7 partes en Markdown y escribe
+  `docs/VALIDATION_REPORT.md` + un CSV con todos los trades de la corrida
+  (`docs/trades_{run_batch_tag}.csv`) — solo lectura de lo que ya calculan
+  los módulos anteriores, ninguna fórmula nueva aquí.
+
+Correrlo:
+
+```bash
+python -m pipeline.validation.report
+```
+
+**El `docs/VALIDATION_REPORT.md` que ya está commiteado en este repo es un
+EJEMPLO real, generado en esta sesión contra ~11 meses de datos sintéticos**
+(el mismo dataset de demo usado para probar el dashboard, con factores
+Fama-French y VIX sintéticos añadidos para que el event study y el split
+por régimen tuvieran algo que medir) — el propio documento lleva una
+advertencia en su primera sección explicando esto, para que nadie lo
+confunda con una recomendación de inversión real. Regenerarlo con datos
+reales (tras completar §1-§3.11) sobrescribe el mismo archivo.
+
+**No se añadió como paso de `nightly_pipeline.yml`**, a diferencia del
+resto del pipeline: un runner de GitHub Actions es efímero, y este paso
+escribe un ARCHIVO (no filas en Postgres) — sin un paso adicional de commit
+automático (que este proyecto nunca ha hecho, y no es de fiar añadir sin
+que lo pida el usuario), el archivo se perdería al terminar el job. Se deja
+como un paso manual/local, igual que §3.2 (verificar EDGAR con un solo día
+antes del backfill completo).
+
 ## 4. Desplegar el dashboard
 
 ```bash
@@ -475,7 +532,7 @@ URL, y `cd app && npm install && npm run dev`.
 | 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
 | 6 | Pre-registro commiteado → `portfolio_report.py` (backtest de cartera) → `paper_trading/report.py` (semana en vivo) → una sola pasada OOS | |
-| 7 | Dashboard (`app/`, §3.11 — ya construido y probado con datos sintéticos, listo para leer datos reales), `event_study.py` + `VALIDATION_REPORT.md` (§6), conclusiones | |
+| 7 | Dashboard (`app/`, §3.11) y `VALIDATION_REPORT.md` (§3.12) — ambos ya construidos y probados con datos sintéticos, listos para leer datos reales — decisión final | |
 
 ## 6. Lo que este commit NO incluye (y por qué)
 

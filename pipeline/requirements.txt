@@ -4,6 +4,7 @@ psycopg[binary]>=3.2
 pandas>=2.2
 numpy>=1.26
 statsmodels>=0.14
+scipy>=1.13
 yfinance>=0.2.40
 anthropic>=1.5
 pytest>=9.0
