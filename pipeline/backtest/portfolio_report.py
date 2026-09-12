@@ -1,14 +1,10 @@
 """portfolio_report.py — ensambla el reporte completo de una corrida
 (spec: "OUTPUTS DAY 4-5") y la recomendación final.
 
-No genera imágenes de gráficos: el proyecto ya tiene una capa de
-visualización (el dashboard de Next.js, ARCHITECTURE_LEAN.md) — este módulo
-devuelve los DATOS estructurados que ese dashboard necesitaría para
-renderizar cada output del spec (curvas de equity, scatter, tablas), igual
-que analyze/event_analysis_pipeline.py:compute_day3_stats hace para las
-estadísticas de la Fase 2. Extender el dashboard para consumir esto es el
-siguiente paso natural, documentado en RUNBOOK.md — no se ha hecho en esta
-sesión por alcance (ver ese documento).
+El dashboard de Next.js (app/, ver RUNBOOK.md §3.9 y §4) lee este reporte
+completo desde `portfolio_reports.report_json` y lo renderiza — todas las
+fórmulas (Sharpe/Sortino/Calmar, calibración, buckets de confidence, etc.)
+viven aquí y en portfolio_metrics.py, nunca reimplementadas en TypeScript.
 """
 from __future__ import annotations
 
@@ -21,6 +17,7 @@ from pipeline.backtest.portfolio_metrics import (
     compute_asymmetry_report,
     compute_bias_report,
     compute_calibration,
+    compute_calibration_diagnostics,
     compute_equity_metrics,
     compute_metrics_by_event_type,
     compute_prediction_regression,
@@ -96,6 +93,20 @@ def build_version_report(conn, version: str, run_batch_tag: str, starting_capita
             split = entry_dates[0] + timedelta(days=span_days // 2)
             stability = compute_temporal_stability_report(trades, split)
 
+    # Calibración confidence-vs-resultado (dashboard Fase 5, TAB 2 "win rate
+    # by confidence bucket" Y TAB 3 "calibration curve" — mismo cálculo,
+    # compute_calibration_diagnostics ya incluye los buckets). Un trade
+    # "gana" si pnl_pct>0, misma convención conservadora que
+    # compute_trade_metrics (0 exacto cuenta como perdedor). Distinto del
+    # campo `calibration` de arriba (fórmula 1-|pred-real|/|pred| sobre EV
+    # vs retorno, no sobre confidence vs acierto) — dos preguntas distintas,
+    # ver RUNBOOK.md §3.10 sobre por qué no se unifican.
+    confidence_calibration = compute_calibration_diagnostics(
+        [{"confidence": float(t["confidence"]), "won": float(t["pnl_pct"]) > 0} for t in trades],
+        "confidence",
+        "won",
+    )
+
     return {
         "version": version,
         "run_batch_tag": run_batch_tag,
@@ -103,9 +114,15 @@ def build_version_report(conn, version: str, run_batch_tag: str, starting_capita
         "equity_metrics": equity_metrics,
         "equity_curve": [{"trade_date": r["trade_date"].isoformat(), "balance": float(r["balance"])} for r in equity_curve],
         "metrics_by_event_type": by_event_type,
+        "confidence_calibration": confidence_calibration,
         "calibration": calibration,
         "prediction_regression": regression,
         "asymmetry": asymmetry,
+        # all_trades: alimenta el feed "ALL SIGNALS" (TAB 1) y el histograma
+        # de retornos (TAB 2) — top_10_winners/losers no alcanza para esos
+        # dos usos, que necesitan la distribución completa, no solo los
+        # extremos.
+        "all_trades": [_serialize_trade(t) for t in trades],
         "top_10_winners": [_serialize_trade(t) for t in top_n_trades(trades, 10, winners=True)],
         "top_10_losers": [_serialize_trade(t) for t in top_n_trades(trades, 10, winners=False)],
         "no_lookahead_violations": violations,
@@ -118,10 +135,13 @@ def _serialize_trade(t: dict) -> dict:
         "event_id": t["event_id"],
         "ticker": t.get("ticker"),
         "event_class": t.get("event_class"),
+        "direction": t["direction"],
         "entry_date": t["entry_date"].isoformat(),
         "exit_date": t["exit_date"].isoformat(),
         "exit_reason": t["exit_reason"],
         "pnl_pct": float(t["pnl_pct"]),
+        "confidence": float(t["confidence"]),
+        "ev": float(t["ev"]),
     }
 
 

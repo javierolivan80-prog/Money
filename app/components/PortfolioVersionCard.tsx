@@ -7,6 +7,10 @@
 // como cada función de portfolio_metrics.py los devuelve).
 import type { PortfolioVersionReport } from "@/lib/queries";
 import { PortfolioEquityCurve } from "./PortfolioEquityCurve";
+import { ScatterPredictedActual } from "./ScatterPredictedActual";
+import { ConfidenceBucketBars } from "./ConfidenceBucketBars";
+import { ReturnHistogram } from "./ReturnHistogram";
+import { DrawdownChart } from "./DrawdownChart";
 
 const VERSION_LABELS: Record<string, string> = {
   CONSERVATIVE: "Conservative",
@@ -119,6 +123,28 @@ export function PortfolioVersionCard({
       <div className="mb-4">
         <PortfolioEquityCurve points={report.equity_curve} startingCapital={startingCapital} />
       </div>
+
+      <details className="text-xs mb-3">
+        <summary className="cursor-pointer text-neutral-500 mb-2">Drawdown (underwater plot)</summary>
+        <DrawdownChart equityCurve={report.equity_curve} />
+      </details>
+
+      <details className="text-xs mb-3">
+        <summary className="cursor-pointer text-neutral-500 mb-2">Distribución de retornos</summary>
+        <ReturnHistogram pnlPcts={report.all_trades.map((t) => t.pnl_pct)} />
+      </details>
+
+      <details className="text-xs mb-3">
+        <summary className="cursor-pointer text-neutral-500 mb-2">Predicho vs. real (scatter)</summary>
+        <ScatterPredictedActual points={report.prediction_regression.scatter} rSquared={report.prediction_regression.r_squared} />
+      </details>
+
+      <details className="text-xs mb-3">
+        <summary className="cursor-pointer text-neutral-500 mb-2">
+          Win rate por banda de confidence {report.confidence_calibration.correlation !== null && `(correl=${report.confidence_calibration.correlation.toFixed(2)})`}
+        </summary>
+        <ConfidenceBucketBars buckets={report.confidence_calibration.buckets} />
+      </details>
 
       {temporal_stability && (
         <details className="text-xs mb-3">

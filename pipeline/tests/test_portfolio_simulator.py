@@ -11,6 +11,7 @@ import pytest
 from pipeline.backtest.portfolio_simulator import (
     COMMISSION_BPS_ROUND_TRIP,
     OpenPosition,
+    _build_entry_plan,
     compute_position_mtm_dollars,
     compute_target_date,
     compute_tp_sl_prices,
@@ -290,3 +291,54 @@ def test_compute_target_date_falls_back_to_last_available_day_when_data_runs_out
     calendar = [D0, D0 + timedelta(days=1), D0 + timedelta(days=2)]
     target = compute_target_date(D0, holding_period_max_days=20, ticker_trading_dates=calendar)
     assert target == calendar[-1]
+
+
+# ---------------------------------------------------------------------------
+# _build_entry_plan — el caso "entry_date es el último día de precio
+# disponible" (bug real encontrado al probar el dashboard con datos
+# sintéticos: generaba exit_date == entry_date, violación anti-look-ahead).
+# ticker_cache se pre-llena a mano para no necesitar una conexión real (la
+# función solo toca `conn` cuando el ticker no está ya en el cache).
+# ---------------------------------------------------------------------------
+
+
+def _bar(o=100.0, h=101.0, l=99.0, c=100.5, warn=False):
+    return {"open_raw": o, "high_raw": h, "low_raw": l, "close_raw": c, "survivorship_warning": warn}
+
+
+def test_build_entry_plan_skips_event_when_entry_is_last_available_price_day():
+    """d0 es el penúltimo día del panel de precios -> entry_date (D+1) es el
+    ÚLTIMO día disponible, sin ningún día posterior para simular la
+    posición. Antes del fix, esto generaba target_date == entry_date y un
+    cierre forzado el mismo día que la entrada — una violación
+    anti-look-ahead real, no un caso de borde inofensivo."""
+    d0 = D0
+    entry_date = D0 + timedelta(days=1)
+    ticker_cache = {"EDGE": {d0: _bar(), entry_date: _bar()}}  # nada después de entry_date
+    events = [
+        {
+            "event_id": 99, "ticker": "EDGE", "d0_close_date": d0,
+            "trade_decision": "LONG", "ev_conservative": 0.01, "ev_aggressive": 0.01, "ev_balanced": 0.01,
+            "confidence": 80.0, "prediction": 0.6,
+        }
+    ]
+    plan = _build_entry_plan(conn=None, version="CONSERVATIVE", events=events, ticker_cache=ticker_cache)
+    assert plan == []
+
+
+def test_build_entry_plan_includes_event_when_at_least_one_day_after_entry_exists():
+    d0 = D0
+    entry_date = D0 + timedelta(days=1)
+    one_more_day = D0 + timedelta(days=2)
+    ticker_cache = {"OK": {d0: _bar(), entry_date: _bar(), one_more_day: _bar()}}
+    events = [
+        {
+            "event_id": 100, "ticker": "OK", "d0_close_date": d0,
+            "trade_decision": "LONG", "ev_conservative": 0.01, "ev_aggressive": 0.01, "ev_balanced": 0.01,
+            "confidence": 80.0, "prediction": 0.6,
+        }
+    ]
+    plan = _build_entry_plan(conn=None, version="CONSERVATIVE", events=events, ticker_cache=ticker_cache)
+    assert len(plan) == 1
+    assert plan[0]["entry_date"] == entry_date
+    assert plan[0]["target_date"] > entry_date

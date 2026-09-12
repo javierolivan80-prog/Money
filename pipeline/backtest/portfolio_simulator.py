@@ -326,6 +326,19 @@ def _build_entry_plan(conn, version: str, events: list[dict], ticker_cache: dict
         if entry_bar["open_raw"] is None:
             logger.warning("Evento %d (%s): sin precio de apertura en la fecha de entrada, se omite", ev["event_id"], ticker)
             continue
+        if not any(d > entry_date for d in prices):
+            # entry_date es el ÚLTIMO día de negociación disponible para este
+            # ticker: no hay ni un solo día posterior para observar la
+            # posición. Sin esto, compute_target_date() degenera a
+            # target_date == entry_date, y el cierre forzado al final del
+            # panel de precios (simulate_portfolio) generaría exit_date ==
+            # entry_date — una violación anti-look-ahead real, no un caso de
+            # borde inofensivo (pasaría en producción cada vez que un evento
+            # se analice el mismo día en que termina el backfill de precios
+            # disponible). Se omite con el mismo criterio que "sin precios
+            # posteriores a D0": no hay nada que simular todavía.
+            logger.warning("Evento %d (%s): la entrada D+1 (%s) es el último día de precio disponible, sin días posteriores para simular — se omite", ev["event_id"], ticker, entry_date)
+            continue
 
         direction = "LONG" if float(ev["prediction"]) > 0 else "SHORT"
         if version == "BALANCED":

@@ -1,7 +1,8 @@
-import Link from "next/link";
 import { isDatabaseConfigured } from "@/lib/db";
 import { getLatestPortfolioRunBatchTag, getPortfolioReport } from "@/lib/queries";
 import { PortfolioVersionCard } from "@/components/PortfolioVersionCard";
+import { Nav } from "@/components/Nav";
+import { ExportPdfButton } from "@/components/ExportPdfButton";
 
 export const dynamic = "force-dynamic"; // siempre lee datos frescos de Postgres, sin caché estática
 
@@ -11,7 +12,8 @@ export default async function PortfolioBacktestPage() {
   if (!isDatabaseConfigured()) {
     return (
       <main className="max-w-3xl mx-auto p-8">
-        <h1 className="text-2xl font-bold mb-4">Backtest de cartera — Fase 4</h1>
+        <Nav active="/portfolio" />
+        <h1 className="text-2xl font-bold mb-4">Backtest Analysis</h1>
         <div className="border border-amber-300 bg-amber-50 dark:bg-amber-950 dark:border-amber-800 rounded-lg p-4">
           <p className="font-medium mb-2">DATABASE_URL no está configurada.</p>
           <p className="text-sm text-neutral-600 dark:text-neutral-400">
@@ -28,7 +30,8 @@ export default async function PortfolioBacktestPage() {
   if (!runBatchTag) {
     return (
       <main className="max-w-3xl mx-auto p-8">
-        <h1 className="text-2xl font-bold mb-4">Backtest de cartera — Fase 4</h1>
+        <Nav active="/portfolio" />
+        <h1 className="text-2xl font-bold mb-4">Backtest Analysis</h1>
         <div className="border border-neutral-300 dark:border-neutral-700 rounded-lg p-4">
           <p className="font-medium mb-2">Todavía no hay ningún backtest de cartera registrado.</p>
           <p className="text-sm text-neutral-600 dark:text-neutral-400">
@@ -37,9 +40,6 @@ export default async function PortfolioBacktestPage() {
             <code>RUNBOOK.md §3.9</code>.
           </p>
         </div>
-        <Link href="/" className="text-sm underline mt-4 inline-block">
-          ← Volver al backtest simple
-        </Link>
       </main>
     );
   }
@@ -52,7 +52,8 @@ export default async function PortfolioBacktestPage() {
     // queries — mejor un mensaje claro que un 500 sin contexto.
     return (
       <main className="max-w-3xl mx-auto p-8">
-        <h1 className="text-2xl font-bold mb-4">Backtest de cartera — Fase 4</h1>
+        <Nav active="/portfolio" />
+        <h1 className="text-2xl font-bold mb-4">Backtest Analysis</h1>
         <p className="text-sm text-neutral-500">
           No se pudo leer el reporte para <code>{runBatchTag}</code>.
         </p>
@@ -65,12 +66,11 @@ export default async function PortfolioBacktestPage() {
 
   return (
     <main className="max-w-7xl mx-auto p-6">
+      <Nav active="/portfolio" />
       <header className="mb-6">
         <div className="flex items-baseline justify-between flex-wrap gap-2">
-          <h1 className="text-2xl font-bold">Backtest de cartera — Fase 4</h1>
-          <Link href="/" className="text-sm underline">
-            ← Backtest simple (Fase 1)
-          </Link>
+          <h1 className="text-2xl font-bold">Backtest Analysis</h1>
+          <ExportPdfButton report={report} />
         </div>
         <p className="text-sm text-neutral-500 mt-1">
           Corrida: <code className="font-mono">{runBatchTag}</code> · Capital inicial:{" "}

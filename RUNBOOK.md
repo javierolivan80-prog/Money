@@ -369,6 +369,87 @@ antes de conectar el paso a `nightly_pipeline.yml` — ver el historial de
   + ECE, compartida entre esta fase y el dashboard) vs `compute_calibration`
   (la fórmula de razón de la Fase 3).
 
+### 3.11 Dashboard — Fase 5 ("Dashboard con 3 columnas paralelas")
+
+Rediseño completo de `app/` sobre el spec de la Fase 5. Sustituye al
+dashboard de la Fase 1 (que leía `backtest_runs`, el event study de una
+ventana fija de 20 días) — ese backend sigue existiendo y corriendo cada
+noche (sigue siendo la fuente de `AUDIT_LEAN.md` §2.2.3 y de
+`event_study.py`, Fase 6), pero ya no tiene página propia: sus números
+"¿existe un edge?" son un dato de fondo, no lo que este dashboard enseña
+(que responde "¿es operable?").
+
+**Rutas** (barra de navegación compartida, `components/Nav.tsx`):
+- `/` — Overview: header + 3 columnas paralelas (Conservative/Balanced/
+  Aggressive), cada una con curva de equity combinada (histórico +
+  overlay de paper trading de la semana, Recharts), métricas clave,
+  posiciones abiertas y últimas 5 cerradas de paper trading, y el
+  finding de la recomendación para esa versión.
+- `/signals` — TAB 1 "All Signals": feed cronológico de TODOS los eventos
+  analizados (con o sin trade_decision), con filtros (ticker, event type,
+  signal, rango de fechas, confidence mínima) resueltos en SQL en el
+  servidor — Tanstack Table solo ordena/pagina lo ya filtrado. Bull/Bear/
+  Judge colapsable por fila.
+- `/portfolio` — TAB 2 "Backtest Analysis": el detalle completo del
+  backtest histórico (extendido en esta fase con scatter predicho-vs-real,
+  win rate por banda de confidence, histograma de retornos, drawdown/
+  underwater plot — los 4 en Recharts) + el botón de exportar PDF.
+- `/calibration` — TAB 3: curva de calibración (confidence vs win rate
+  real, con la diagonal de referencia), Brier score, ECE, e
+  interpretación textual (over/under/bien calibrado) con una sugerencia
+  de ajuste. **Sin sliders interactivos**: el spec pide "sliders: ajustar
+  confidence futura" pero no hay ningún mecanismo que consuma ese ajuste
+  (ni un endpoint, ni una re-simulación) — un slider que no cambia nada
+  sería un elemento de UI que miente sobre lo que hace. Se muestra la
+  sugerencia de ajuste como texto en su lugar.
+- `/comparison` — TAB 4: tabla lado a lado de las 3 versiones (Tanstack
+  Table).
+- `/week` — TAB 5 "Signals This Week": vista en vivo del paper trading de
+  la semana — trades ejecutados/abiertos/cerrados, win rate, P&L diario
+  (barras), calibración preliminar, y la comparación "¿coincide con el
+  backtest histórico?" de `paper_trading/report.py`.
+
+**Recharts y Tanstack Table**: primer uso de ambos en el proyecto —
+pedidos explícitamente por este spec (a diferencia del spec de la Fase 1,
+que pedía deliberadamente evitar dependencias de charting; se sigue la
+instrucción más reciente del usuario). `@tanstack/react-table` debe fijarse
+en la línea 8.x — la versión "latest" que instala npm por defecto en este
+momento es una v9 con una API completamente distinta (`createCoreRowModel`
+en vez de `getCoreRowModel`, etc.), no la API estándar documentada que
+espera el resto del ecosistema.
+
+**Export PDF** (`components/ExportPdfButton.tsx`, botón en `/portfolio`):
+genera un PDF real en el cliente con jsPDF + jspdf-autotable — resumen,
+recomendación, tablas de métricas por versión, top 5 ganadores/perdedores,
+event study por clase. **No incrusta las curvas de equity como imagen**:
+capturar un SVG de Recharts a canvas (html2canvas) es frágil (fuentes,
+tainted canvas, tamaño variable) para el beneficio que aporta en un POC;
+en su lugar, cada curva se representa como su tabla de puntos clave
+(balance inicial/final/pico/valle). Probado de extremo a extremo con
+Playwright (`page.waitForEvent('download')`), no solo con `next build`.
+
+**Bug real encontrado durante esta fase** (no en código nuevo — en
+`portfolio_simulator.py`, ya en producción desde la Fase 3/4): si la
+entrada D+1 de un evento resulta ser el ÚLTIMO día de precio disponible
+para ese ticker (cero días posteriores para observar la posición),
+`compute_target_date` degenera a `target_date == entry_date`, y el cierre
+forzado al final del backtest generaba `exit_date == entry_date` — una
+violación real de la constraint anti-look-ahead (`chk_portfolio_no_lookahead`
+la habría rechazado en un INSERT real; en memoria, el assert de
+`consolidate_trade_record` la atrapó primero). Nunca se había disparado
+porque ningún dato sintético anterior tenía un evento tan pegado al final
+del panel de precios — apareció al construir datos de demo para probar el
+dashboard con paper trading en el borde del calendario. Corregido en
+`_build_entry_plan`: un evento así se omite (mismo criterio que "sin
+precios posteriores a D0"), con test de regresión en
+`test_portfolio_simulator.py`.
+
+**Componentes retirados**: `StrategyColumn.tsx` y `EquityCurve.tsx` (Fase
+1) — sin uso una vez que `/` pasó a leer `portfolio_reports` +
+`paper_trading_reports` en vez de `backtest_runs`. Las queries
+correspondientes (`getStrategySummaries`, `getEquityCurve`, `getTrades`,
+`getLatestRunBatchTag`) también se eliminaron de `lib/queries.ts`.
+
 ## 4. Desplegar el dashboard
 
 ```bash
@@ -393,8 +474,8 @@ URL, y `cd app && npm install && npm run dev`.
 | 3 | Factores FF3, verificar `universe` con deslistados | |
 | 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
-| 6 | Pre-registro commiteado → `portfolio_report.py` (Fase 4, backtest de cartera) → una sola pasada OOS | |
-| 7 | Dashboard con datos reales (`app/portfolio`, §3.9, ya lee el reporte de la Fase 4), conclusiones | |
+| 6 | Pre-registro commiteado → `portfolio_report.py` (backtest de cartera) → `paper_trading/report.py` (semana en vivo) → una sola pasada OOS | |
+| 7 | Dashboard (`app/`, §3.11 — ya construido y probado con datos sintéticos, listo para leer datos reales), `event_study.py` + `VALIDATION_REPORT.md` (§6), conclusiones | |
 
 ## 6. Lo que este commit NO incluye (y por qué)
 
@@ -428,22 +509,21 @@ URL, y `cd app && npm install && npm run dev`.
   guidance/rumor sobre ese texto tampoco existen todavía. Todo lo demás de
   la Fase 3 (Bull/Bear con texto real, novelty con guidance/rumor) funciona
   igual de bien para EDGAR sin esperar a esto.
-- **El dashboard de Next.js no consume el backtest de cartera (Fase 4)**:
-  esto YA NO es un hueco — `app/portfolio` (nueva ruta) lee
-  `portfolio_reports.report_json` (nueva tabla, poblada automáticamente por
-  `run_full_backtest()`) y dibuja las ~15 métricas, la curva de equity en
-  dólares, calibración, submétricas por tipo de evento, estabilidad
-  temporal, top 10 ganadores/perdedores, el reporte de sesgos, y el
-  veredicto final, con el mismo patrón sin librería de charting que ya usaba
-  `StrategyColumn.tsx`/`EquityCurve.tsx` en `/`. Ver §3.9 para cómo verlo
-  localmente. Lo único que se dejó fuera de esta extensión: el scatter
-  predicho-vs-real (el dato ya viaja en `prediction_regression.scatter`,
-  pintarlo es directo pero era el único output puramente visual sin ya una
-  tabla equivalente en la página, así que no compite por prioridad con nada
-  más de esta sesión).
+- **El dashboard de Next.js**: esto YA NO es un hueco — `app/` es ahora el
+  dashboard completo de la Fase 5 (§3.11): overview de 3 columnas con
+  overlay de paper trading, y los 5 tabs del spec (All Signals, Backtest
+  Analysis, Calibration, Comparison, Signals This Week), con Recharts y
+  Tanstack Table, más export a PDF. Lo único que se dejó fuera a propósito:
+  los sliders de "ajustar confidence" de TAB 3 (no hay ningún mecanismo que
+  consuma ese ajuste — ver §3.11) y la actualización en tiempo real vía
+  WebSocket (el dashboard es `force-dynamic`: siempre lee datos frescos de
+  Postgres en cada visita/recarga, que es lo que "cada cierre o refresco
+  manual" pide el spec — un push en vivo no aporta nada sobre un batch
+  nocturno).
 
 Ninguna de estas ausencias es una limitación de diseño — son, literalmente,
 las partes que necesitan datos reales (EDGAR, FDA, o el texto de filings ya
 descargados) que este sandbox no puede obtener para escribir contra ellas
-con confianza, o un scatter plot que quedó fuera del alcance de esta sesión.
-Escribirlas a ciegas habría sido peor que dejarlas explícitas aquí.
+con confianza, o piezas de UI (sliders sin backend, WebSockets) que
+quedaron fuera del alcance por no aportar nada real en un POC. Escribirlas
+a ciegas habría sido peor que dejarlas explícitas aquí.
