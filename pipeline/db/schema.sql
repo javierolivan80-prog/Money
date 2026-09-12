@@ -72,6 +72,17 @@ CREATE INDEX IF NOT EXISTS idx_events_class_date ON events (event_class, d0_clos
 CREATE INDEX IF NOT EXISTS idx_events_ticker ON events (ticker);
 CREATE INDEX IF NOT EXISTS idx_events_hash ON events (raw_text_hash);
 
+-- Columnas de Fase 3 (ingest/filing_text.py), vía ALTER — CREATE TABLE
+-- IF NOT EXISTS no las habría añadido a una tabla `events` ya existente
+-- (misma lección aprendida en la Fase 2 con prices.high_raw/low_raw: ver ahí
+-- para el porqué). NULL hasta que el backfill de texto corra sobre el evento;
+-- eventos FDA (source != 'EDGAR') se quedan en NULL permanentemente hasta que
+-- exista un scraper de FDA — ver filing_text.py:populate_missing_filing_text.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_length_chars INT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_includes_exhibit BOOLEAN;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_extracted_at TIMESTAMPTZ;
+
 -- ============================================================================
 -- prices: panel diario. close_raw + adj_factor separados a propósito (ver cabecera).
 -- ============================================================================

@@ -89,6 +89,15 @@ jobs:
             python -m pipeline.ingest.edgar_scraper --start "$YESTERDAY" --end "$YESTERDAY"
           fi
 
+      - name: Extraer texto de filings pendientes (Fase 3 — insumo de Bull/Bear/novelty)
+        # Va justo después de la ingesta EDGAR y ANTES del análisis: sin esto,
+        # adversarial_analyzer.py degrada al placeholder y novelty.py no puede
+        # calcular has_prior_guidance/rumor_flag (ver filing_text.py).
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+        run: python -m pipeline.ingest.filing_text
+
       - name: Ingesta factores Fama-French (barato, se puede refrescar cada noche)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

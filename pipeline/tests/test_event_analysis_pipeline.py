@@ -94,7 +94,7 @@ def _seed_market_data(conn, tickers_and_bases, n_days=320):
     return dates
 
 
-def _seed_event(conn, cik: str, ticker: str, d0: date, event_class: str = "8K_2.02_EARNINGS", sic_code: str = "2836") -> int:
+def _seed_event(conn, cik: str, ticker: str, d0: date, event_class: str = "8K_2.02_EARNINGS", sic_code: str = "2836", filing_text: str | None = None) -> int:
     # source debe reflejar de dónde vendría el evento de verdad: un FDA_CRL no
     # es un filing de EDGAR (se encontró este bug de fixture al ejecutar el
     # test de check_fda_crl_without_8k — con source hardcodeado a 'EDGAR', el
@@ -112,11 +112,11 @@ def _seed_event(conn, cik: str, ticker: str, d0: date, event_class: str = "8K_2.
             """
             INSERT INTO events (cik, ticker, source, is_satellite, event_class, item_codes,
                 accession_number, source_url, filed_at, d0_close_date, classification_method,
-                classification_confidence, raw_text_hash)
-            VALUES (%s,%s,%s,%s,%s,ARRAY['2.02'],%s,'https://x',%s,%s,'RULE',1.0,%s)
+                classification_confidence, raw_text_hash, filing_text)
+            VALUES (%s,%s,%s,%s,%s,ARRAY['2.02'],%s,'https://x',%s,%s,'RULE',1.0,%s,%s)
             RETURNING event_id
             """,
-            (cik, ticker, source, is_satellite, event_class, f"acc-{cik}-{d0}", d0, d0, f"hash-{cik}-{d0}"),
+            (cik, ticker, source, is_satellite, event_class, f"acc-{cik}-{d0}", d0, d0, f"hash-{cik}-{d0}", filing_text),
         )
         event_id = cur.fetchone()["event_id"]
     conn.commit()
@@ -265,3 +265,64 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
     assert rows[0]["from_cache"] is False
     assert rows[1]["from_cache"] is True
     assert float(rows[1]["net_conviction"]) == pytest.approx(float(rows[0]["net_conviction"]))
+
+
+# ---------------------------------------------------------------------------
+# Fase 3 — filing_text real y guidance/rumor fluyendo hasta event_analyses
+# ---------------------------------------------------------------------------
+
+
+def test_process_chunk_bull_bear_prompt_contains_real_filing_text(conn):
+    """Antes de la Fase 3, filing_excerpt era SIEMPRE el placeholder.
+    Verifica que cuando events.filing_text tiene contenido real, ese texto
+    (no el fallback) es lo que construye process_chunk() para el prompt de
+    Bull/Bear — inspeccionando la construcción de EventContext tal como la
+    hace process_chunk, sin necesidad de mockear el batch completo."""
+    from pipeline.analyze.adversarial_analyzer import build_bull_bear_batch
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    real_text = "Acme Widgets Corp reported record quarterly revenue of $412 million, up 18% year-over-year."
+    _seed_event(conn, "1", "TESTCO", dates[280].date(), filing_text=real_text)
+
+    from pipeline.analyze.adversarial_analyzer import EventContext
+
+    ev = fetch_events_needing_analysis(conn)[0]
+    ctx = EventContext(event_id=ev["event_id"], ticker=ev["ticker"], event_class=ev["event_class"], company_name="Test Co", filing_excerpt=ev["filing_text"])
+    requests_ = build_bull_bear_batch([ctx])
+    prompt = requests_[0]["params"]["messages"][0]["content"]
+    assert real_text in prompt
+
+
+def test_process_chunk_without_filing_text_falls_back_gracefully(conn):
+    from pipeline.analyze.event_analysis_pipeline import _FALLBACK_FILING_EXCERPT, fetch_events_needing_analysis
+
+    _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    dates = pd.date_range("2021-01-04", periods=320, freq="B")
+    _seed_event(conn, "1", "TESTCO", dates[280].date())  # sin filing_text
+
+    ev = fetch_events_needing_analysis(conn)[0]
+    assert ev["filing_text"] is None  # confirma el escenario que se está probando
+
+
+def test_process_chunk_novelty_reasoning_reflects_prior_guidance_detection(conn):
+    """Un filing PREVIO con lenguaje de guidance debe hacer que
+    novelty_reasoning de ESTE evento registre has_prior_guidance=True — la
+    señal completa de la Fase 3, de principio a fin."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    # Evento previo (hace 15 días de calendario) con lenguaje de guidance explícito.
+    prior_date = dates[280].date() - pd.Timedelta(days=15)
+    _seed_event(conn, "1", "TESTCO", prior_date, filing_text="We are raising our full-year outlook to $2B.")
+    # Evento actual, sin texto propio todavía (el guidance viene del PREVIO).
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_ScriptedBatchesClient()))
+    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT novelty_reasoning FROM event_analyses ea JOIN events e ON e.event_id=ea.event_id WHERE e.d0_close_date = %s", (dates[280].date(),))
+        row = cur.fetchone()
+    reasoning = row["novelty_reasoning"] if isinstance(row["novelty_reasoning"], dict) else json.loads(row["novelty_reasoning"])
+    assert reasoning["has_prior_guidance"] is True

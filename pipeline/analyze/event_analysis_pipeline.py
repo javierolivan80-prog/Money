@@ -43,8 +43,11 @@ from pipeline.analyze.adversarial_analyzer import (
 )
 from pipeline.analyze.enrichment import fetch_and_compute_enrichment
 from pipeline.analyze.ev_engine import compute_ev
+from pipeline.analyze.guidance_detector import compute_novelty_signals
 from pipeline.analyze.historical_analogues import estimate_impact_for_event
 from pipeline.analyze.novelty import NoveltyInputs, compute_novelty
+
+_FALLBACK_FILING_EXCERPT = "(sin texto de filing extraído todavía — ver ingest/filing_text.py)"
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,7 @@ def fetch_events_needing_analysis(conn, limit: int = CHUNK_SIZE) -> list[dict]:
         cur.execute(
             """
             SELECT e.event_id, e.cik, e.ticker, e.event_class, e.source, e.d0_close_date,
-                   u.company_name, u.sic_code
+                   e.filing_text, u.company_name, u.sic_code
             FROM events e
             JOIN universe u ON u.cik = e.cik
             LEFT JOIN event_analyses ea ON ea.event_id = e.event_id
@@ -115,9 +118,10 @@ def process_chunk(conn, client, event_rows: list[dict]) -> None:
                 ticker=ev["ticker"],
                 event_class=ev["event_class"],
                 company_name=ev["company_name"],
-                # Placeholder documentado (mismo gap que Fase 1, RUNBOOK.md):
-                # la extracción de texto real del filing no está construida.
-                filing_excerpt="(placeholder — extracción de texto de filing pendiente, ver RUNBOOK.md)",
+                # Fase 3: texto real del filing cuando existe (ingest/filing_text.py
+                # ya lo extrajo); si no, degrada al placeholder — un evento sin
+                # texto todavía no debe bloquear el análisis, solo empobrecerlo.
+                filing_excerpt=ev["filing_text"] or _FALLBACK_FILING_EXCERPT,
             )
             for ev in needs_llm
         ]
@@ -138,7 +142,19 @@ def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_resu
     enrichment = fetch_and_compute_enrichment(conn, ev)
 
     # --- Etapa 2: novelty (SIEMPRE fresco) ---
-    novelty = compute_novelty(NoveltyInputs(pre_event_drift_pct=enrichment.pre_event_drift_pct or 0.0))
+    # Fase 3: has_prior_guidance/rumor_flag ya no son siempre None — se
+    # calculan sobre filing_text de eventos previos del mismo ticker (ver
+    # guidance_detector.py). Si esos filings aún no tienen texto extraído,
+    # compute_novelty_signals devuelve None y compute_novelty renormaliza
+    # pesos igual que antes (comportamiento sin cambios en ese caso).
+    has_guidance, rumor_flag = compute_novelty_signals(conn, ev["ticker"], ev["d0_close_date"])
+    novelty = compute_novelty(
+        NoveltyInputs(
+            pre_event_drift_pct=enrichment.pre_event_drift_pct or 0.0,
+            has_prior_guidance=has_guidance,
+            rumor_flag=rumor_flag,
+        )
+    )
 
     # --- Etapas 3-5: Bull/Bear/Judge (de caché o de LLM) ---
     from_cache = cache_hit is not None

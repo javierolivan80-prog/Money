@@ -32,17 +32,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-import requests
-
 from pipeline import config
+from pipeline.ingest.edgar_http import throttled_get
 
 logger = logging.getLogger(__name__)
-
-HEADERS = {"User-Agent": config.EDGAR_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 
 # Mapa de Item de 8-K -> event_class. Cobertura deliberadamente acotada a las
 # clases con n suficiente para tener potencia estadística (AUDIT_LEAN.md §2.2.3).
@@ -59,9 +55,6 @@ ITEM_TO_EVENT_CLASS = {
     "8.01": "8K_8.01_OTHER",
 }
 
-_RATE_LIMIT_DELAY = 1.0 / config.EDGAR_RATE_LIMIT_PER_SEC
-
-
 @dataclass
 class RawFiling:
     accession_number: str
@@ -72,32 +65,6 @@ class RawFiling:
     item_codes: list[str]
     source_url: str
     raw_text_hash: str
-
-
-def _throttled_get(url: str, **kwargs) -> requests.Response:
-    """GET con rate limit fijo y reintentos con backoff exponencial.
-
-    La SEC devuelve 429 si se supera el límite; también hay que tolerar caídas
-    de red transitorias. Backoff: 2s, 4s, 8s, 16s (igual que la política de git
-    del resto del proyecto, por consistencia).
-    """
-    delays = [2, 4, 8, 16]
-    last_exc: Exception | None = None
-    for attempt, delay in enumerate([0] + delays):
-        if delay:
-            time.sleep(delay)
-        time.sleep(_RATE_LIMIT_DELAY)
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30, **kwargs)
-            if resp.status_code == 429:
-                logger.warning("429 de EDGAR en %s, reintentando", url)
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as exc:  # noqa: PERF203
-            last_exc = exc
-            logger.warning("Fallo en %s (intento %d): %s", url, attempt, exc)
-    raise RuntimeError(f"No se pudo descargar {url} tras reintentos") from last_exc
 
 
 def daily_index_url(day: date) -> str:
@@ -202,7 +169,7 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
     backfill completo (ver --single-day en el bloque __main__).
     """
     url = f"{config.EDGAR_BASE}/{file_name}"
-    resp = _throttled_get(url)
+    resp = throttled_get(url)
     text = resp.text
     accession_match = re.search(r"ACCESSION NUMBER:\s*(\S+)", text)
     accession = accession_match.group(1) if accession_match else file_name
@@ -256,7 +223,7 @@ def compute_d0_close_date(filed_at: datetime) -> date:
 def scrape_day(day: date) -> list[RawFiling]:
     """Descarga y normaliza todos los 8-K relevantes de un día concreto."""
     logger.info("Descargando daily-index de %s", day.isoformat())
-    resp = _throttled_get(daily_index_url(day))
+    resp = throttled_get(daily_index_url(day))
     rows = parse_daily_index(resp.text)
     logger.info("%d formularios 8-K encontrados el %s", len(rows), day.isoformat())
 

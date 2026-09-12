@@ -22,14 +22,16 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los **112 tests** de `pipeline/tests/` pasan (39 de la Fase 1 + 73 de la
-  Fase 2), incluyendo decenas contra un **Postgres 16 real** levantado en
+- Los **148 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
+  Fase 3), incluyendo decenas contra un **Postgres 16 real** levantado en
   este sandbox (no un mock) — schema, upserts idempotentes, CHECK constraints
   anti-look-ahead, detección de gaps de supervivencia, la caché de 24h de
-  Bull/Bear/Judge, el filtro anti-look-ahead de análogos históricos, y un
-  test de integración de extremo a extremo de las 8 etapas de la Fase 2
-  (enrichment → novelty → Bull/Bear/Judge → impact → EV → abstención →
-  persistencia) con un cliente de Anthropic simulado.
+  Bull/Bear/Judge, el filtro anti-look-ahead de análogos históricos y de
+  filings previos (guidance/rumor), y un test de integración de extremo a
+  extremo de las 8 etapas (enrichment → novelty → Bull/Bear/Judge → impact →
+  EV → abstención → persistencia) con un cliente de Anthropic simulado —
+  incluida la variante con texto real de filing fluyendo hasta el prompt de
+  Bull/Bear y hasta `novelty_reasoning`.
 - El motor de backtest pasó **T1 (placebo)** y una réplica sintética de
   **T2** con datos generados, no reales — ver `ARCHITECTURE_LEAN.md` §8 para
   qué significa cada uno.
@@ -39,8 +41,9 @@ a cada pieza):
   métricas) — esto encontró y corrigió un bug real (node-postgres devuelve
   columnas NUMERIC como string, no number).
 - **Lo que NO se validó, porque no hay red hacia esos hosts desde aquí:** el
-  scraper de EDGAR, el backfill de yfinance, y el fetcher de Ken French nunca
-  se han ejecutado contra los servidores reales. Siguen el formato público
+  scraper de EDGAR, el backfill de yfinance, el fetcher de Ken French, y
+  (Fase 3) el extractor de texto de filings (`filing_text.py`) nunca se han
+  ejecutado contra los servidores reales. Siguen el formato público
   documentado, pero cada uno lleva una advertencia en su docstring señalando
   exactamente qué verificar a mano antes de confiar en un backfill completo.
 - **Lo que tampoco se validó, porque tampoco hay clave**: ninguna llamada a
@@ -118,7 +121,33 @@ Esto puede tardar horas por el rate limit de la SEC (8 req/s). Es resumible:
 si se corta, vuelve a lanzar — el `UNIQUE` constraint hace que no duplique
 nada ya insertado.
 
-### 3.4 Backfill de precios (yfinance) — el paso más frágil
+### 3.4 Extraer texto de filings (Fase 3 — insumo de Bull/Bear y novelty)
+
+**Nunca se ha descargado el cuerpo de un filing real desde este sandbox**
+(mismo problema de red que el resto — AUDIT_LEAN.md §1.5). El parser sigue
+el formato "full submission text file" de EDGAR (bloques `<DOCUMENT>` con
+TYPE/SEQUENCE/FILENAME/TEXT), pero antes del backfill completo:
+
+```bash
+export EDGAR_USER_AGENT="Tu Nombre tu@email.com"
+python -m pipeline.ingest.filing_text --single-event <un event_id real>
+```
+
+Lee el texto extraído a mano: ¿quedó HTML/CSS suelto? ¿se cortó a mitad de
+frase? Para un evento de earnings (8K_2.02), confirma que se usó el exhibit
+de prensa (`includes_exhibit=True`) y no solo el cuerpo del 8-K — el 8-K en
+sí casi siempre es solo "ver el comunicado adjunto", sin la noticia real.
+
+Backfill completo:
+
+```bash
+python -m pipeline.ingest.filing_text
+```
+
+Los eventos de FDA (`source != 'EDGAR'`) se saltan automáticamente — no hay
+scraper de FDA todavía (§6).
+
+### 3.5 Backfill de precios (yfinance) — el paso más frágil
 **Lánzalo en paralelo al resto, el primer día, no lo dejes para el final**
 (`ARCHITECTURE_LEAN.md` §7: es la dependencia crítica del plan de 7 días).
 
@@ -147,13 +176,13 @@ antes de relanzar, para no perder tiempo redescargando).
 `survivorship_warning = TRUE`. NO intentes llenarlas ni interpolarlas — es
 información, no un bug (instrucción explícita, ver docstring del script).
 
-### 3.5 Factores Fama-French
+### 3.6 Factores Fama-French
 
 ```bash
 python -m pipeline.ingest.fama_french
 ```
 
-### 3.6 Calcular CAR de eventos (insumo de los análogos históricos)
+### 3.7 Calcular CAR de eventos (insumo de los análogos históricos)
 
 ```bash
 python -m pipeline.backtest.populate_car_results
@@ -162,9 +191,9 @@ python -m pipeline.backtest.populate_car_results
 Sin esto, la Etapa 6 (`analyze/historical_analogues.py`) verá `n_analogues=0`
 para todo, y el EV/abstención de la Fase 2 se calculará sin ningún análogo
 histórico real detrás — no falla, pero pierde la mitad de su fundamento.
-Correrlo después de tener precios (§3.4) y factores (§3.5) cargados.
+Correrlo después de tener precios (§3.5) y factores (§3.6) cargados.
 
-### 3.7 Smoke test del pipeline de análisis (Fase 2, Etapas 1-8)
+### 3.8 Smoke test del pipeline de análisis (Fase 2, Etapas 1-8)
 **Nunca se ha llamado a la API de Anthropic en vivo desde esta sesión** (sin
 `ANTHROPIC_API_KEY` configurada aquí, ni en la Fase 1 ni en la Fase 2). Antes
 del backfill completo de ~25k eventos, limita el orquestador a un puñado
@@ -219,7 +248,7 @@ URL, y `cd app && npm install && npm run dev`.
 | Día | Qué hacer | Bloqueante |
 |---|---|---|
 | 1 | Provisionar Neon/Supabase, configurar secrets, `--single-day` de EDGAR, **lanzar backfill de yfinance en background** | El backfill de precios es la ruta crítica |
-| 2 | Backfill completo de EDGAR, ingesta FDA/RSS (no incluida en este commit — ver §6 de este documento) | |
+| 2 | Backfill completo de EDGAR, extracción de texto de filings (`filing_text.py`), ingesta FDA/RSS (no incluida — ver §6) | |
 | 3 | Factores FF3, verificar `universe` con deslistados | |
 | 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
@@ -238,25 +267,26 @@ URL, y `cd app && npm install && npm run dev`.
   (`abstention_engine.py` regla 6, `check_fda_crl_without_8k` en el
   orquestador) — solo falta que la tabla `events` tenga filas con
   `source IN ('FDA_RSS','FDA_OPENFDA')`.
-- **Extracción del texto real del filing**: sigue pendiente desde la Fase 1,
-  y la Fase 2 la hereda en dos sitios nuevos, no solo en Bull/Bear:
-  - `adversarial_analyzer.py` sigue recibiendo un placeholder de texto
-    (`filing_excerpt`) — Bull/Bear/Judge razonan sobre metadatos del evento,
-    no sobre el contenido real del filing.
-  - `novelty.py` (Etapa 2) **no puede calcular** `has_prior_guidance` ni
-    `rumor_flag` sin esto — hoy el novelty_score se calcula SOLO con el
-    componente de movimiento de precio pre-evento (ver
-    `novelty.py:compute_novelty`, que renormaliza pesos cuando faltan
-    componentes en vez de fingir neutralidad). Es una limitación real del
-    score, no oculta: `event_analyses.novelty_reasoning` deja constancia de
-    qué componentes se usaron en cada fila.
-  Sigue siendo un paso de scraping adicional del mismo tipo que
-  `edgar_scraper.py`, no un cambio de diseño — descargar el `.txt` completo
-  del filing (ya se tiene la URL) y extraer el texto del Item relevante.
+- **Extracción del texto real del filing**: esto YA NO es un hueco —
+  `pipeline/ingest/filing_text.py` (Fase 3) lo cierra: descarga el submission
+  completo, separa los documentos `<DOCUMENT>`, y prefiere el exhibit de
+  prensa (`EX-99*`) sobre el cuerpo del 8-K para earnings (que suele ser solo
+  "ver el comunicado adjunto"). `adversarial_analyzer.py` ya recibe el texto
+  real cuando existe (con fallback al placeholder si aún no se ha extraído),
+  y `pipeline/analyze/guidance_detector.py` calcula `has_prior_guidance`/
+  `rumor_flag` para `novelty.py` a partir de filings previos del mismo
+  ticker — por palabras clave, no NLP semántico (limitación documentada en
+  su propio módulo, no oculta). Ver §3.4.
 - **CAR de eventos** (el "día 4" del plan de `ARCHITECTURE_LEAN.md`): esto
   YA NO es un hueco — `pipeline/backtest/populate_car_results.py` se
   construyó en la Fase 2 precisamente porque `historical_analogues.py`
-  dependía de él. Ver §3.6.
+  dependía de él. Ver §3.7.
+- **Ingesta de FDA sigue siendo el único hueco real que queda** de los tres
+  originales — y con ella, la ingesta del texto de filings de FDA (distinto
+  formato al de EDGAR, `filing_text.py` no lo cubre) y la detección de
+  guidance/rumor sobre ese texto tampoco existen todavía. Todo lo demás de
+  la Fase 3 (Bull/Bear con texto real, novelty con guidance/rumor) funciona
+  igual de bien para EDGAR sin esperar a esto.
 
 Ninguna de estas ausencias es una limitación de diseño — son, literalmente,
 las partes que necesitan datos reales (EDGAR, FDA, o el texto de filings ya

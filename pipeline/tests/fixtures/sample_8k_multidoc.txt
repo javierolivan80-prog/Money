@@ -1,0 +1,58 @@
+<SEC-DOCUMENT>0001234567-24-000123.txt : 20240315
+<SEC-HEADER>0001234567-24-000123.hdr.sgml : 20240315
+<ACCEPTANCE-DATETIME>20240315161234
+ACCESSION NUMBER:		0001234567-24-000123
+CONFORMED SUBMISSION TYPE:	8-K
+PUBLIC DOCUMENT COUNT:		3
+CONFORMED PERIOD OF REPORT:	20240315
+ITEM INFORMATION:		2.02
+ITEM INFORMATION:		9.01
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>8-K
+<SEQUENCE>1
+<FILENAME>form8k.htm
+<DESCRIPTION>FORM 8-K
+<TEXT>
+<html>
+<body>
+<p>Item 2.02. Results of Operations and Financial Condition.</p>
+<p>On March 15, 2024, Acme Widgets Corp issued a press release announcing its
+financial results for the fiscal quarter ended February 29, 2024. A copy of
+the press release is attached hereto as Exhibit 99.1 and is incorporated
+herein by reference.</p>
+</body>
+</html>
+</TEXT>
+</DOCUMENT>
+<DOCUMENT>
+<TYPE>EX-99.1
+<SEQUENCE>2
+<FILENAME>ex991pressrelease.htm
+<DESCRIPTION>PRESS RELEASE
+<TEXT>
+<html>
+<head><style>.hidden { display: none; }</style></head>
+<body>
+<script>var trackingPixel = true;</script>
+<h1>Acme Widgets Corp Reports Record Quarterly Revenue of $412 Million</h1>
+<p>ACME CITY, March 15, 2024 -- Acme Widgets Corp (NASDAQ: ACME) today reported
+revenue of $412 million for the quarter, up 18% year-over-year, beating
+analyst consensus estimates of $390 million. The company also raised its
+full-year guidance to $1.65-$1.70 billion, citing strong demand across all
+product lines.</p>
+<p>"This was an exceptional quarter," said Jane Smith, CEO.</p>
+</body>
+</html>
+</TEXT>
+</DOCUMENT>
+<DOCUMENT>
+<TYPE>EX-101.SCH
+<SEQUENCE>3
+<FILENAME>acme-20240315.xsd
+<DESCRIPTION>XBRL SCHEMA
+<TEXT>
+<xml><xbrl>irrelevant structured data, not a press release</xbrl></xml>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>
