@@ -14,7 +14,7 @@
 #
 # Requiere estos secrets del repo (ver RUNBOOK.md para cómo obtenerlos):
 #   DATABASE_URL        — Postgres alojado (Neon/Supabase free tier)
-#   ANTHROPIC_API_KEY    — para pipeline/analyze/adversarial_analyzer.py
+#   ANTHROPIC_API_KEY    — para pipeline/analyze/event_analysis_pipeline.py (Bull/Bear/Judge)
 #   EDGAR_USER_AGENT      — "Tu Nombre tu@email.com" (la SEC lo exige)
 
 name: Nightly Pipeline
@@ -94,11 +94,22 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.ingest.fama_french
 
-      - name: Análisis adversarial (Bull/Bear/Judge) de eventos nuevos
+      - name: Calcular CAR de eventos pendientes (insumo de historical_analogues.py)
+        # Sin este paso, analyze/historical_analogues.py siempre vería
+        # n_analogues=0 — car_results no se llena solo (ver su docstring).
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.backtest.populate_car_results
+
+      - name: Análisis de eventos (Fase 2 — Etapas 1-8, event_analysis_pipeline.py)
+        # Reemplaza al script de la Fase 1 (adversarial_analyzer.py --smoke-test),
+        # que ya no escribe en la base de datos por sí solo — ahora es el
+        # orquestador quien llama a Bull/Bear/Judge y combina el resultado con
+        # enrichment/novelty/impact/EV/abstention antes de guardar en event_analyses.
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python -m pipeline.analyze.adversarial_analyzer --smoke-test 50
+        run: python -m pipeline.analyze.event_analysis_pipeline
 
   # El backfill de precios (yfinance) va en un job SEPARADO, manual, no en el
   # cron nocturno normal: es la etapa lenta y frágil (ARCHITECTURE_LEAN.md §7)

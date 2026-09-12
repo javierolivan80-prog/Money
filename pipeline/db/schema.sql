@@ -10,9 +10,14 @@
 --     backtest de hoy no es reproducible mañana.
 --   - is_delisted_flag en universe: no se rellenan huecos, se marcan (spec del usuario).
 --
--- 3 tablas "main" pedidas por el spec: events, analyses, backtest_runs.
+-- 3 tablas "main" pedidas por el spec de Fase 1: events, analyses, backtest_runs.
 -- prices y universe son soporte imprescindible (no opcional: sin ellas no hay
 -- CAR, y sin universe no se puede medir sesgo de supervivencia — AUDIT_LEAN.md §2.4).
+--
+-- FASE 2 (Análisis de eventos) añade event_enrichment (Etapa 1) y
+-- event_analyses (Etapas 2-8: novelty, Bull/Bear/Judge, impact, EV,
+-- abstention), que sustituye a la tabla `analyses` de la Fase 1 — ver la
+-- cabecera de event_analyses más abajo para el porqué del reemplazo.
 
 CREATE TABLE IF NOT EXISTS universe (
     cik                 TEXT PRIMARY KEY,
@@ -86,6 +91,21 @@ CREATE TABLE IF NOT EXISTS prices (
 
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices (ticker, trade_date);
 
+-- Columnas añadidas en Fase 2, vía ALTER en vez de en el CREATE TABLE de
+-- arriba: `CREATE TABLE IF NOT EXISTS` es un no-op silencioso sobre una tabla
+-- que ya existe, así que reaplicar schema.sql en un despliegue que ya corrió
+-- la Fase 1 NUNCA habría añadido estas columnas (se encontró al reaplicar el
+-- schema sobre el Postgres local de esta sesión, que ya tenía `prices` de la
+-- Fase 1 — no en una tabla nueva, donde el problema pasa desapercibido).
+-- `ADD COLUMN IF NOT EXISTS` sí es idempotente en Postgres 9.6+.
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS high_raw NUMERIC;  -- proxy de spread/liquidez:
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS low_raw NUMERIC;   -- (high-low)/close — ver
+                                                                -- abstention_engine.py. No es
+                                                                -- bid-ask real: no hay datos de
+                                                                -- microestructura gratis
+                                                                -- (AUDIT_LEAN.md §2.1). Proxy
+                                                                -- documentado, no ocultado.
+
 -- ============================================================================
 -- fama_french_factors: panel diario de factores (Ken French Data Library).
 -- ============================================================================
@@ -99,31 +119,119 @@ CREATE TABLE IF NOT EXISTS fama_french_factors (
 );
 
 -- ============================================================================
--- analyses: salida del motor adversarial (Bull/Bear/Judge) por evento.
+-- car_results: retorno anormal acumulado (CAR) por evento y ventana,
+-- calculado por backtest/backtester.py:compute_car(). FALTABA en la Fase 1:
+-- compute_car() devolvía el resultado en memoria pero nada lo persistía —
+-- sin esta tabla, "historical analogues ya calculados" (Etapa 6 de la Fase 2)
+-- no tenía nada que leer. Se añade aquí porque analyze/historical_analogues.py
+-- la necesita, no como limpieza de la Fase 1 en sí, pero de paso cierra ese
+-- hueco (documentado en RUNBOOK.md).
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS analyses (
-    analysis_id         BIGSERIAL PRIMARY KEY,
-    event_id            BIGINT NOT NULL REFERENCES events(event_id),
-    model               TEXT NOT NULL,         -- 'claude-haiku-4-5'
-    batch_id            TEXT,                  -- id del batch de Anthropic, para trazabilidad
-    bull_thesis         TEXT NOT NULL,
-    bull_expected_move_pct NUMERIC,             -- % esperado, dirección + magnitud
-    bull_confidence     NUMERIC CHECK (bull_confidence BETWEEN 0 AND 1),
-    bear_thesis         TEXT NOT NULL,
-    bear_expected_move_pct NUMERIC,
-    bear_confidence     NUMERIC CHECK (bear_confidence BETWEEN 0 AND 1),
-    judge_verdict        TEXT NOT NULL,         -- resumen del arbitraje Bull vs Bear
-    judge_expected_move_pct NUMERIC NOT NULL,   -- síntesis final: EV direccional
-    judge_confidence     NUMERIC NOT NULL CHECK (judge_confidence BETWEEN 0 AND 1),
-    ev_score             NUMERIC NOT NULL,       -- expected_move * confidence, usado para sizing
-    -- IMPORTANTE anti-look-ahead: el análisis solo puede usar información
-    -- disponible en o antes de events.d0_close_date. Se aplica en el código
-    -- (el prompt nunca recibe precios posteriores a D0), no solo aquí.
-    analyzed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (event_id, model)
+CREATE TABLE IF NOT EXISTS car_results (
+    event_id             BIGINT NOT NULL REFERENCES events(event_id),
+    window_days           INT NOT NULL,        -- 5 o 20, coincide con backtest/backtester.py
+    car                   NUMERIC NOT NULL,     -- fracción, no % (0.05 = 5%)
+    abnormal_volume_ratio  NUMERIC,
+    n_estimation_days      INT NOT NULL,
+    computed_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (event_id, window_days)
 );
 
-CREATE INDEX IF NOT EXISTS idx_analyses_event ON analyses (event_id);
+-- Soporta la query de analogues: por clase, ordenado por fecha, excluyendo
+-- eventos futuros respecto al evento que se está evaluando (ver
+-- analyze/historical_analogues.py — es la misma disciplina anti-look-ahead
+-- del resto del proyecto, aplicada a la ventana de análogos históricos).
+CREATE INDEX IF NOT EXISTS idx_car_results_class_lookup ON events (event_class, d0_close_date, event_id);
+
+-- ============================================================================
+-- event_enrichment: salida de la Etapa 1 (Fase 2) — features de mercado por
+-- evento, calculadas UNA VEZ y reutilizadas por novelty/impact/EV, en vez de
+-- recalcularlas en cada etapa. Todo lo que entra aquí usa SOLO datos
+-- disponibles en o antes de events.d0_close_date (mismo principio
+-- anti-look-ahead que backtest_runs — ver ARCHITECTURE_LEAN.md §4).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS event_enrichment (
+    event_id             BIGINT PRIMARY KEY REFERENCES events(event_id),
+    price_d0             NUMERIC,             -- cierre ajustado del día del evento
+    price_d_minus_5      NUMERIC,
+    price_d_minus_20     NUMERIC,
+    volume_d0            BIGINT,
+    volume_avg_20d       NUMERIC,
+    volume_ratio         NUMERIC,             -- volume_d0 / volume_avg_20d
+    beta_vs_spy          NUMERIC,             -- de la regresión de factores (coef. de mkt_rf)
+    ff_size_exposure     NUMERIC,             -- coef. de SMB
+    ff_value_exposure    NUMERIC,             -- coef. de HML
+    vix_d0               NUMERIC,
+    sector_etf_ticker    TEXT,                -- ETF usado como proxy de sector (ver enrichment.py)
+    sector_mood          NUMERIC,             -- retorno_sector_d0 - retorno_spy_d0
+    pre_event_drift_pct  NUMERIC,             -- retorno D-5 -> D-1, insumo del novelty engine
+    high_low_range_pct   NUMERIC,             -- (high-low)/close en D0 — proxy de liquidez/spread
+    n_estimation_days    INT,                 -- días usados en la regresión — baja confianza si es poco
+    had_survivorship_warning BOOLEAN NOT NULL DEFAULT FALSE,  -- copiado de prices, propaga a abstention
+    enriched_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- event_analyses: pipeline completo de la Fase 2 (Etapas 2-8), un registro
+-- por evento con TRAZA COMPLETA de cada etapa (pedido explícito: "esto
+-- permite debugear decisiones malas después"). Sustituye a la tabla `analyses`
+-- de la Fase 1 (Bull/Bear/Judge con esquema simple) — nada dependía de esa
+-- tabla en producción, así que se reemplaza en vez de mantener dos esquemas
+-- paralelos.
+--
+-- Columnas JSONB para el output completo de cada etapa (auditoría) MÁS
+-- columnas planas para los campos que se filtran/agregan a menudo (evita
+-- tener que hacer ->> en cada query de stats del día 3).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS event_analyses (
+    event_id              BIGINT PRIMARY KEY REFERENCES events(event_id),
+
+    -- Etapa 2: Novelty Engine
+    novelty_score          NUMERIC NOT NULL CHECK (novelty_score BETWEEN 0 AND 100),
+    novelty_reasoning       JSONB NOT NULL,     -- {pre_event_drift, has_guidance, rumor_flag, ...}
+
+    -- Etapas 3-5: Bull / Bear / Judge (JSONB = el JSON exacto que pide el spec)
+    bull_analyst_output      JSONB NOT NULL,
+    bear_analyst_output      JSONB NOT NULL,
+    judge_output             JSONB NOT NULL,
+    net_conviction           NUMERIC NOT NULL CHECK (net_conviction BETWEEN -1 AND 1),
+    confidence_in_conviction NUMERIC NOT NULL CHECK (confidence_in_conviction BETWEEN 0 AND 100),
+
+    -- Etapa 6: Impact Estimation
+    impact_estimation        JSONB NOT NULL,
+    n_historical_analogues    INT NOT NULL,     -- tamaño de muestra detrás de impact_estimation —
+                                                 -- clave para no confundir confianza con ruido
+                                                 -- (AUDIT_LEAN.md §2.2.3, MDE por clase de evento)
+
+    -- Etapa 7: Expected Value Engine
+    ev_calculation           JSONB NOT NULL,
+    ev_conservative           NUMERIC NOT NULL,
+    ev_aggressive             NUMERIC NOT NULL,
+    ev_balanced               NUMERIC NOT NULL,
+
+    -- Etapa 8: Abstention Engine (una decisión POR VERSIÓN de estrategia, no una sola global —
+    -- el mismo evento puede ser TRADE para Aggressive y NO_TRADE para Conservative)
+    abstention_decision       JSONB NOT NULL,    -- {CONSERVATIVE: {...}, AGGRESSIVE: {...}, BALANCED: {...}}
+    trade_decision_conservative TEXT NOT NULL CHECK (trade_decision_conservative IN ('LONG','SHORT','NO_TRADE')),
+    trade_decision_aggressive   TEXT NOT NULL CHECK (trade_decision_aggressive IN ('LONG','SHORT','NO_TRADE')),
+    trade_decision_balanced     TEXT NOT NULL CHECK (trade_decision_balanced IN ('LONG','SHORT','NO_TRADE')),
+
+    -- Metadatos / auditoría (pedido explícito: audit trail completo)
+    model_version_bull_bear    TEXT NOT NULL,   -- 'claude-haiku-4-5'
+    model_version_judge        TEXT NOT NULL,   -- 'claude-sonnet-4-6'
+    batch_id_bull_bear          TEXT,
+    batch_id_judge               TEXT,
+    from_cache                   BOOLEAN NOT NULL DEFAULT FALSE,  -- TRUE si reusó un análisis
+                                                                   -- de (ticker,event_class) <24h
+    analyzed_at                   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_analyses_trade_balanced ON event_analyses (trade_decision_balanced);
+CREATE INDEX IF NOT EXISTS idx_event_analyses_analyzed_at ON event_analyses (analyzed_at);
+
+-- Soporta la caché de 24h por (ticker, event_class): busca el análisis más
+-- reciente de esa combinación sin tener que escanear toda la tabla.
+CREATE INDEX IF NOT EXISTS idx_events_ticker_class_for_cache ON events (ticker, event_class, d0_close_date);
 
 -- ============================================================================
 -- backtest_runs: un run = una versión de estrategia evaluada sobre un conjunto
@@ -144,7 +252,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     exit_price_5d          NUMERIC,
     exit_price_20d         NUMERIC,
     predicted_direction    TEXT NOT NULL CHECK (predicted_direction IN ('LONG', 'SHORT', 'NO_TRADE')),
-    predicted_ev_pct       NUMERIC NOT NULL,     -- de analyses.ev_score en el momento de decidir
+    predicted_ev_pct       NUMERIC NOT NULL,     -- de event_analyses.ev_balanced (u otra versión) en el momento de decidir
     realized_return_5d_pct  NUMERIC,             -- retorno real D+1(apertura)->D+5(cierre)
     realized_return_20d_pct NUMERIC,
     slippage_bps_applied    NUMERIC NOT NULL DEFAULT 25,  -- barrido de sensibilidad T7

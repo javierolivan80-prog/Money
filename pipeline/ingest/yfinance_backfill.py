@@ -128,17 +128,26 @@ def _store_with_gap_detection(conn, ticker: str, df: pd.DataFrame, expected_days
             close_raw = float(row["Close"])
             adj_close = float(row["Adj Close"])
             adj_factor = adj_close / close_raw if close_raw else None
+            # high_raw/low_raw añadidos en Fase 2: los usa
+            # analyze/abstention_engine.py como proxy de spread/liquidez
+            # ((high-low)/close) — no hay bid-ask real gratis (AUDIT_LEAN.md
+            # §2.1). yf.download con auto_adjust=False ya trae High/Low sin
+            # petición adicional.
+            high_raw = float(row["High"])
+            low_raw = float(row["Low"])
             cur.execute(
                 """
-                INSERT INTO prices (ticker, trade_date, close_raw, adj_factor, volume, survivorship_warning)
-                VALUES (%s, %s, %s, %s, %s, FALSE)
+                INSERT INTO prices (ticker, trade_date, close_raw, high_raw, low_raw, adj_factor, volume, survivorship_warning)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
                 ON CONFLICT (ticker, trade_date) DO UPDATE SET
                     close_raw = EXCLUDED.close_raw,
+                    high_raw = EXCLUDED.high_raw,
+                    low_raw = EXCLUDED.low_raw,
                     adj_factor = EXCLUDED.adj_factor,
                     volume = EXCLUDED.volume,
                     captured_at = now()
                 """,
-                (ticker, d, close_raw, adj_factor, int(row["Volume"])),
+                (ticker, d, close_raw, high_raw, low_raw, adj_factor, int(row["Volume"])),
             )
         # Días esperados dentro del rango de ESTE ticker que no vinieron en absoluto:
         # se marcan como huecos sin inventar una fila de precio.

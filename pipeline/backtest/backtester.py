@@ -36,6 +36,8 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
+from pipeline.backtest.factor_model import fit_factor_model
+
 logger = logging.getLogger(__name__)
 
 STRATEGY_THRESHOLDS = {
@@ -80,26 +82,17 @@ def compute_car(
     tratarse como "no evaluable", NUNCA como CAR=0.
     """
     merged = event_prices.join(factor_returns, how="inner")
-    est_start = pd.Timestamp(d0_close_date) + pd.Timedelta(days=estimation_window[0])
-    est_end = pd.Timestamp(d0_close_date) + pd.Timedelta(days=estimation_window[1])
-    est_data = merged[(merged.index >= est_start) & (merged.index <= est_end)]
-
-    if len(est_data) < 60:
-        logger.warning("Ventana de estimación insuficiente (%d días) — evento no evaluable", len(est_data))
+    fit = fit_factor_model(merged, d0_close_date, estimation_window)
+    if fit is None:
         return None
 
-    y = est_data["ret"] - est_data["rf"]
-    X = sm.add_constant(est_data[["mkt_rf", "smb", "hml"]])
-    model = sm.OLS(y, X).fit()
-
-    event_start = pd.Timestamp(d0_close_date) + pd.Timedelta(days=1)
     event_end = pd.Timestamp(d0_close_date) + pd.Timedelta(days=window_days)
     event_data = merged[(merged.index > pd.Timestamp(d0_close_date)) & (merged.index <= event_end)]
     if event_data.empty:
         return None
 
     X_event = sm.add_constant(event_data[["mkt_rf", "smb", "hml"]], has_constant="add")
-    expected_ret = model.predict(X_event) + event_data["rf"]
+    expected_ret = fit.model.predict(X_event) + event_data["rf"]
     abnormal_ret = event_data["ret"] - expected_ret
     car = abnormal_ret.sum()
 
@@ -112,7 +105,7 @@ def compute_car(
         window_days=window_days,
         car=float(car),
         abnormal_volume_ratio=float(abnormal_volume_ratio) if not np.isnan(abnormal_volume_ratio) else None,
-        n_estimation_days=len(est_data),
+        n_estimation_days=fit.n_estimation_days,
     )
 
 

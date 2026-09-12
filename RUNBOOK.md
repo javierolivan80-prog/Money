@@ -22,10 +22,14 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los 39 tests de `pipeline/tests/` pasan, incluyendo contra un **Postgres 16
-  real** levantado en este sandbox (no un mock) — el schema, los upserts
-  idempotentes, los CHECK constraints anti-look-ahead, y la detección de gaps
-  de supervivencia se probaron con SQL real ejecutándose de verdad.
+- Los **112 tests** de `pipeline/tests/` pasan (39 de la Fase 1 + 73 de la
+  Fase 2), incluyendo decenas contra un **Postgres 16 real** levantado en
+  este sandbox (no un mock) — schema, upserts idempotentes, CHECK constraints
+  anti-look-ahead, detección de gaps de supervivencia, la caché de 24h de
+  Bull/Bear/Judge, el filtro anti-look-ahead de análogos históricos, y un
+  test de integración de extremo a extremo de las 8 etapas de la Fase 2
+  (enrichment → novelty → Bull/Bear/Judge → impact → EV → abstención →
+  persistencia) con un cliente de Anthropic simulado.
 - El motor de backtest pasó **T1 (placebo)** y una réplica sintética de
   **T2** con datos generados, no reales — ver `ARCHITECTURE_LEAN.md` §8 para
   qué significa cada uno.
@@ -39,6 +43,21 @@ a cada pieza):
   se han ejecutado contra los servidores reales. Siguen el formato público
   documentado, pero cada uno lleva una advertencia en su docstring señalando
   exactamente qué verificar a mano antes de confiar en un backfill completo.
+- **Lo que tampoco se validó, porque tampoco hay clave**: ninguna llamada a
+  la API de Anthropic (Bull/Bear/Judge) se ha hecho en vivo — ni en la Fase 1
+  ni en la Fase 2. Se probó la construcción de las requests (modelos, JSON
+  schemas exactos del spec) y el parseo de respuestas con la forma exacta que
+  documenta el SDK, con mocks — nunca contra el servidor real.
+
+### 0.1 Sobre la premisa de la Fase 2 ("tienes tabla events con 50k+ eventos")
+
+Esa premisa no es cierta todavía: `events` está vacía en este entorno (nada
+se ha ejecutado contra EDGAR real, ver arriba). La Fase 2 se construyó y
+validó igual que la Fase 1 — con Postgres real y datos sintéticos donde no
+hay datos reales que usar — para que el código esté listo el día que la Fase
+1 corra de verdad en GitHub Actions (§3). El pipeline entero (Etapas 1-8) es
+correcto y está probado; lo que falta es que existan eventos reales sobre
+los que correrlo.
 
 ## 1. Qué necesitas crear (cuentas gratuitas)
 
@@ -134,20 +153,51 @@ información, no un bug (instrucción explícita, ver docstring del script).
 python -m pipeline.ingest.fama_french
 ```
 
-### 3.6 Smoke test del analizador Bull/Bear/Judge
+### 3.6 Calcular CAR de eventos (insumo de los análogos históricos)
+
+```bash
+python -m pipeline.backtest.populate_car_results
+```
+
+Sin esto, la Etapa 6 (`analyze/historical_analogues.py`) verá `n_analogues=0`
+para todo, y el EV/abstención de la Fase 2 se calculará sin ningún análogo
+histórico real detrás — no falla, pero pierde la mitad de su fundamento.
+Correrlo después de tener precios (§3.4) y factores (§3.5) cargados.
+
+### 3.7 Smoke test del pipeline de análisis (Fase 2, Etapas 1-8)
 **Nunca se ha llamado a la API de Anthropic en vivo desde esta sesión** (sin
-`ANTHROPIC_API_KEY` configurada aquí). Antes del backfill completo de ~25k
-eventos:
+`ANTHROPIC_API_KEY` configurada aquí, ni en la Fase 1 ni en la Fase 2). Antes
+del backfill completo de ~25k eventos, limita el orquestador a un puñado
+editando temporalmente `CHUNK_SIZE` en `event_analysis_pipeline.py`, o
+simplemente lánzalo sobre una tabla `events` pequeña primero:
 
 ```bash
 export ANTHROPIC_API_KEY="tu-clave"
-python -m pipeline.analyze.adversarial_analyzer --smoke-test 5
+python -m pipeline.analyze.event_analysis_pipeline
 ```
 
-Revisa a mano las 5 tesis Bull/Bear/Judge generadas en la tabla `analyses`.
-Si el JSON no parsea o los campos no tienen sentido, es más barato
-descubrirlo en 5 eventos que en 25.000 ($0.02 vs. ~$50-100 —
-`ARCHITECTURE_LEAN.md` §6).
+Revisa a mano varias filas de `event_analyses`: ¿las tesis Bull/Bear tienen
+sentido para el evento? ¿`net_conviction` del Judge parece razonable dado el
+Bull/Bear que recibió? ¿`trade_decision_balanced` coincide con lo que
+esperarías mirando `abstention_decision` a mano? Es más barato encontrar un
+prompt mal calibrado en 5 eventos que en 25.000.
+
+Después, revisa las estadísticas del día 3 (pedidas por el spec):
+
+```bash
+python -c "
+from pipeline.db.connection import get_connection
+from pipeline.analyze.event_analysis_pipeline import compute_day3_stats
+import json
+print(json.dumps(compute_day3_stats(get_connection()), indent=2))
+"
+```
+
+Si `pct_trade_*` sale muy fuera de 10-70%, la función ya te da una
+recomendación de qué umbral tocar en `ev_engine.EV_THRESHOLDS` — pero
+**el ajuste es manual, a propósito** (ver docstring de `compute_day3_stats`:
+auto-ajustar umbrales mirando la salida de la misma corrida que se evalúa es
+el tipo de sobreajuste que `AUDIT_LEAN.md` prohíbe explícitamente).
 
 ## 4. Desplegar el dashboard
 
@@ -171,34 +221,45 @@ URL, y `cd app && npm install && npm run dev`.
 | 1 | Provisionar Neon/Supabase, configurar secrets, `--single-day` de EDGAR, **lanzar backfill de yfinance en background** | El backfill de precios es la ruta crítica |
 | 2 | Backfill completo de EDGAR, ingesta FDA/RSS (no incluida en este commit — ver §6 de este documento) | |
 | 3 | Factores FF3, verificar `universe` con deslistados | |
-| 4 | Correr `compute_car` sobre eventos reales | |
+| 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
 | 6 | Pre-registro commiteado → backtest in-sample → una sola pasada OOS | |
 | 7 | Dashboard con datos reales, conclusiones | |
 
 ## 6. Lo que este commit NO incluye (y por qué)
 
-- **Ingesta de FDA (openFDA + RSS)**: el spec de esta ronda pidió "EDGAR es el
+- **Ingesta de FDA (openFDA + RSS)**: el spec de la Fase 1 pidió "EDGAR es el
   eje: earnings + 8-K. FDA es satélite exploratorio" — se priorizó construir
   y validar bien la pata EDGAR (que es donde vive la potencia estadística,
   `AUDIT_LEAN.md` §2.2.3) antes que dispersar el esfuerzo. Añadir
   `pipeline/ingest/fda_scraper.py` siguiendo el mismo patrón de
-  `edgar_scraper.py` es directo cuando llegue el momento.
-- **Extracción del texto real del filing**: `edgar_scraper.py` guarda la URL
-  y los metadatos del filing, pero `adversarial_analyzer.py` todavía recibe
-  un placeholder de texto (`filing_excerpt`) en el bloque `__main__`. Falta
-  la función que descargue el documento del 8-K y extraiga el texto relevante
-  (probablemente el Item 2.02 o el press release adjunto) — es un paso de
-  scraping adicional, del mismo tipo que `edgar_scraper.py`, no un cambio de
-  diseño.
-- **El orquestador que llama a `compute_car` y `run_backtest_for_event` sobre
-  TODOS los eventos de la BD** (el "día 4" del plan): están las funciones
-  (`pipeline/backtest/backtester.py`) y están probadas con datos sintéticos,
-  pero falta el script que las recorra sobre la tabla `events` real, arme el
-  panel de precios/factores desde Postgres, y escriba en `backtest_runs`.
-  Es la pieza que conecta lo ya construido, no lógica nueva.
+  `edgar_scraper.py` es directo cuando llegue el momento. La Fase 2 ya tiene
+  la lógica que depende de eventos FDA lista para cuando existan
+  (`abstention_engine.py` regla 6, `check_fda_crl_without_8k` en el
+  orquestador) — solo falta que la tabla `events` tenga filas con
+  `source IN ('FDA_RSS','FDA_OPENFDA')`.
+- **Extracción del texto real del filing**: sigue pendiente desde la Fase 1,
+  y la Fase 2 la hereda en dos sitios nuevos, no solo en Bull/Bear:
+  - `adversarial_analyzer.py` sigue recibiendo un placeholder de texto
+    (`filing_excerpt`) — Bull/Bear/Judge razonan sobre metadatos del evento,
+    no sobre el contenido real del filing.
+  - `novelty.py` (Etapa 2) **no puede calcular** `has_prior_guidance` ni
+    `rumor_flag` sin esto — hoy el novelty_score se calcula SOLO con el
+    componente de movimiento de precio pre-evento (ver
+    `novelty.py:compute_novelty`, que renormaliza pesos cuando faltan
+    componentes en vez de fingir neutralidad). Es una limitación real del
+    score, no oculta: `event_analyses.novelty_reasoning` deja constancia de
+    qué componentes se usaron en cada fila.
+  Sigue siendo un paso de scraping adicional del mismo tipo que
+  `edgar_scraper.py`, no un cambio de diseño — descargar el `.txt` completo
+  del filing (ya se tiene la URL) y extraer el texto del Item relevante.
+- **CAR de eventos** (el "día 4" del plan de `ARCHITECTURE_LEAN.md`): esto
+  YA NO es un hueco — `pipeline/backtest/populate_car_results.py` se
+  construyó en la Fase 2 precisamente porque `historical_analogues.py`
+  dependía de él. Ver §3.6.
 
 Ninguna de estas ausencias es una limitación de diseño — son, literalmente,
-las partes que necesitan datos reales (EDGAR, FDA, o eventos ya cargados en
-la BD) que este sandbox no puede descargar para escribir contra ellas con
-confianza. Escribirlas a ciegas habría sido peor que dejarlas explícitas aquí.
+las partes que necesitan datos reales (EDGAR, FDA, o el texto de filings ya
+descargados) que este sandbox no puede obtener para escribir contra ellas
+con confianza. Escribirlas a ciegas habría sido peor que dejarlas explícitas
+aquí.

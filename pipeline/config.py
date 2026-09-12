@@ -15,7 +15,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/money
 # --- Anthropic ---
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # requerido para analyze/*
 CLASSIFIER_MODEL = "claude-haiku-4-5"
-ANALYZER_MODEL = "claude-haiku-4-5"
+ANALYZER_MODEL = "claude-haiku-4-5"  # Bull/Bear (Etapas 3-4) — "rápido", pedido por el spec
+# Judge (Etapa 5): "mejor reasoning" — el spec de Fase 2 nombra Sonnet 4.6
+# explícitamente, así que se usa ese ID en vez de la generación más reciente
+# disponible (claude-sonnet-5). Ver adversarial_analyzer.py.
+JUDGE_MODEL = "claude-sonnet-4-6"
 
 # --- EDGAR ---
 # La SEC exige un User-Agent identificable con contacto real. No es opcional:
