@@ -22,8 +22,8 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los **228 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
-  Fase 3 + 80 Fase 4/backtest de cartera), incluyendo decenas contra un
+- Los **229 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
+  Fase 3 + 81 Fase 4/backtest de cartera), incluyendo decenas contra un
   **Postgres 16 real** levantado en este sandbox (no un mock) — schema,
   upserts idempotentes, CHECK constraints anti-look-ahead, detección de gaps
   de supervivencia, la caché de 24h de Bull/Bear/Judge, el filtro
@@ -42,7 +42,16 @@ a cada pieza):
   Postgres real: el estado vacío, el estado "sin runs todavía", y el
   renderizado completo con 30 trades sintéticos (equity curve SVG, tabla,
   métricas) — esto encontró y corrigió un bug real (node-postgres devuelve
-  columnas NUMERIC como string, no number).
+  columnas NUMERIC como string, no number). La página nueva `/portfolio`
+  (Fase 4) se probó igual, en el navegador (capturas con Playwright, no solo
+  `next build`) contra 40 eventos sintéticos con las 3 versiones simuladas —
+  esto encontró y corrigió un bug real distinto, del lado de Python: los
+  `findings` de `generate_recommendation()` interpolaban el float crudo de
+  Sharpe/drawdown/calibración sin formatear en la rama que NO supera los 3
+  criterios (sí lo hacía en la rama que los supera), así que salían cadenas
+  como `Sharpe=-4.1555154199129225` en vez de `Sharpe=-4.16` — invisible en
+  los tests (que solo comparaban el string por `in`, no su formato exacto)
+  hasta que se vio renderizado.
 - **Lo que NO se validó, porque no hay red hacia esos hosts desde aquí:** el
   scraper de EDGAR, el backfill de yfinance, el fetcher de Ken French, y
   (Fase 3) el extractor de texto de filings (`filing_text.py`) nunca se han
@@ -269,11 +278,22 @@ violaciones (para que puedas ver TODAS las de una vez), pero
 `generate_recommendation()` sí las trata como bloqueantes: cualquier versión
 con violaciones nunca puede recibir un "SÍ" en el veredicto final.
 
-**Lo que este módulo NO genera**: imágenes de gráficos (equity curves, el
-scatter de calibración). Devuelve los datos estructurados que un dashboard
-necesitaría para dibujarlos — extender `app/` (el dashboard de Next.js de la
-Fase 1) para consumir `run_full_backtest()` es el siguiente paso natural, no
-hecho en esta sesión por alcance (ver §6).
+`run_full_backtest()` guarda el reporte completo (JSONB) en
+`portfolio_reports`, una fila por `run_batch_tag` — el dashboard de Next.js
+(`app/`, ver §4) lo lee de ahí en `/portfolio` sin reimplementar ninguna
+fórmula de `portfolio_metrics.py`. Para verlo localmente sin esperar al
+pipeline nocturno: corre `portfolio_report.py` como arriba, luego
+`cd app && npm run dev` y abre `http://localhost:3000/portfolio`.
+
+**Lo que la página SÍ dibuja**: las ~15 métricas de riesgo/desempeño, la
+curva de equity en dólares (SVG a mano, mismo patrón que `EquityCurve.tsx`
+de la Fase 1), calibración, submétricas por tipo de evento (con el aviso de
+n<20), estabilidad temporal, top 10 ganadores/perdedores, el reporte de
+sesgos, y el veredicto final con sus findings. **Lo que NO dibuja**: el
+scatter predicho-vs-real (`prediction_regression.scatter` sí viaja en el
+JSON, listo para plotear — pintar el scatter en sí quedó fuera de esta
+sesión por ser el único output puramente visual sin una tabla ya
+equivalente).
 
 **Ambigüedades del spec, resueltas y documentadas en el código, no aquí en
 detalle** — ver las cabeceras de módulo para el razonamiento completo:
@@ -314,7 +334,7 @@ URL, y `cd app && npm install && npm run dev`.
 | 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
 | 6 | Pre-registro commiteado → `portfolio_report.py` (Fase 4, backtest de cartera) → una sola pasada OOS | |
-| 7 | Dashboard con datos reales (extender `app/` para el reporte de la Fase 4 — ver §6), conclusiones | |
+| 7 | Dashboard con datos reales (`app/portfolio`, §3.9, ya lee el reporte de la Fase 4), conclusiones | |
 
 ## 6. Lo que este commit NO incluye (y por qué)
 
@@ -349,21 +369,21 @@ URL, y `cd app && npm install && npm run dev`.
   la Fase 3 (Bull/Bear con texto real, novelty con guidance/rumor) funciona
   igual de bien para EDGAR sin esperar a esto.
 - **El dashboard de Next.js no consume el backtest de cartera (Fase 4)**:
-  `backtest/portfolio_report.py` devuelve todos los datos que pide el spec
-  ("OUTPUTS DAY 4-5" — curvas de equity, tablas de métricas, submétricas por
-  tipo de evento, scatter predicho-vs-real, top 10 ganadores/perdedores) como
-  JSON estructurado, pero `app/` (el dashboard de la Fase 1, que hoy muestra
-  el backtest simple de `backtest_runs`) no tiene todavía las páginas para
-  visualizarlo. Es una extensión directa del mismo patrón que ya usa
-  `StrategyColumn.tsx`/`EquityCurve.tsx` — no un cambio de diseño — pero no
-  se ha hecho en esta sesión por alcance: el motor de simulación, las
-  métricas, y las validaciones ya eran un bloque de trabajo grande por sí
-  solo. Sin esto, para ver los resultados de la Fase 4 hay que consultar
-  `portfolio_trades`/`portfolio_equity_curve` a mano o correr
-  `portfolio_report.py` desde la línea de comandos (§3.9).
+  esto YA NO es un hueco — `app/portfolio` (nueva ruta) lee
+  `portfolio_reports.report_json` (nueva tabla, poblada automáticamente por
+  `run_full_backtest()`) y dibuja las ~15 métricas, la curva de equity en
+  dólares, calibración, submétricas por tipo de evento, estabilidad
+  temporal, top 10 ganadores/perdedores, el reporte de sesgos, y el
+  veredicto final, con el mismo patrón sin librería de charting que ya usaba
+  `StrategyColumn.tsx`/`EquityCurve.tsx` en `/`. Ver §3.9 para cómo verlo
+  localmente. Lo único que se dejó fuera de esta extensión: el scatter
+  predicho-vs-real (el dato ya viaja en `prediction_regression.scatter`,
+  pintarlo es directo pero era el único output puramente visual sin ya una
+  tabla equivalente en la página, así que no compite por prioridad con nada
+  más de esta sesión).
 
 Ninguna de estas ausencias es una limitación de diseño — son, literalmente,
 las partes que necesitan datos reales (EDGAR, FDA, o el texto de filings ya
 descargados) que este sandbox no puede obtener para escribir contra ellas
-con confianza, o trabajo de UI que quedó fuera del alcance de esta sesión.
+con confianza, o un scatter plot que quedó fuera del alcance de esta sesión.
 Escribirlas a ciegas habría sido peor que dejarlas explícitas aquí.

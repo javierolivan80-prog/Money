@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { isDatabaseConfigured } from "@/lib/db";
 import { getEquityCurve, getLatestRunBatchTag, getStrategySummaries, getTrades } from "@/lib/queries";
 import { StrategyColumn } from "@/components/StrategyColumn";
@@ -37,6 +38,9 @@ export default async function DashboardPage() {
             <code>ARCHITECTURE_LEAN.md §9</code> para el plan de 7 días.
           </p>
         </div>
+        <Link href="/portfolio" className="text-sm underline mt-4 inline-block">
+          Backtest de cartera (Fase 4) →
+        </Link>
       </main>
     );
   }
@@ -53,7 +57,12 @@ export default async function DashboardPage() {
   return (
     <main className="max-w-7xl mx-auto p-6">
       <header className="mb-6">
-        <h1 className="text-2xl font-bold">Money POC — Dashboard</h1>
+        <div className="flex items-baseline justify-between flex-wrap gap-2">
+          <h1 className="text-2xl font-bold">Money POC — Dashboard</h1>
+          <Link href="/portfolio" className="text-sm underline">
+            Backtest de cartera (Fase 4) →
+          </Link>
+        </div>
         <p className="text-sm text-neutral-500 mt-1">
           Corrida: <code className="font-mono">{runBatchTag}</code> · Solo lectura ·
           Datos generados por el pipeline nocturno (ver <code>RUNBOOK.md</code>)

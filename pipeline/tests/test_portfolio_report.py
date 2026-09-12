@@ -19,8 +19,8 @@ def conn():
     init_schema(c)
     with c.cursor() as cur:
         cur.execute(
-            "TRUNCATE portfolio_trades, portfolio_equity_curve, car_results, backtest_runs, "
-            "event_analyses, event_enrichment, events, prices, fama_french_factors, universe "
+            "TRUNCATE portfolio_trades, portfolio_equity_curve, portfolio_reports, car_results, "
+            "backtest_runs, event_analyses, event_enrichment, events, prices, fama_french_factors, universe "
             "RESTART IDENTITY CASCADE"
         )
     c.commit()
@@ -132,6 +132,43 @@ def test_run_full_backtest_end_to_end_produces_complete_report(conn):
     # Top winners/losers no deben reventar aunque haya pocos trades.
     assert isinstance(cons["top_10_winners"], list)
     assert isinstance(cons["top_10_losers"], list)
+
+
+def test_run_full_backtest_persists_report_json_for_dashboard(conn):
+    """El dashboard de Next.js (app/) lee portfolio_reports.report_json en
+    vez de reimplementar las métricas — este test es la garantía de que lo
+    que run_full_backtest devuelve es EXACTAMENTE lo que queda guardado
+    (salvo las fechas, serializadas a string por default=str)."""
+    from pipeline.backtest.portfolio_report import run_full_backtest
+
+    cal = _business_days(date(2022, 1, 3), 40)
+    for i in range(3):
+        d0 = cal[i]
+        ticker = f"P{i}"
+        closes = [100.0 + i for _ in cal]
+        _seed_ticker_prices(conn, ticker, cal, closes)
+        _seed_event(conn, f"cik{i}", ticker, d0, decision="LONG", net_conviction=0.7, confidence=80.0, ev=0.01)
+    conn.commit()
+
+    report = run_full_backtest(conn, run_batch_tag="persist-test-1", starting_capital=100_000.0)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT report_json FROM portfolio_reports WHERE run_batch_tag = %s", ("persist-test-1",))
+        row = cur.fetchone()
+
+    assert row is not None
+    stored = row["report_json"]  # psycopg deserializa JSONB directamente a dict
+    assert stored["run_batch_tag"] == report["run_batch_tag"]
+    assert set(stored["versions"].keys()) == set(report["versions"].keys())
+    assert stored["recommendation"]["verdict"] == report["recommendation"]["verdict"]
+
+    # Reejecutar el mismo run_batch_tag debe actualizar la fila (ON CONFLICT
+    # DO UPDATE), no duplicarla — idéntico patrón de idempotencia que
+    # _store_portfolio_results en portfolio_simulator.py.
+    run_full_backtest(conn, run_batch_tag="persist-test-1", starting_capital=100_000.0)
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM portfolio_reports WHERE run_batch_tag = %s", ("persist-test-1",))
+        assert cur.fetchone()["n"] == 1
 
 
 def test_generate_recommendation_flags_lookahead_violations_as_blocking():

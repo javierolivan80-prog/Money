@@ -166,3 +166,160 @@ export async function getLatestRunBatchTag(): Promise<string | null> {
   );
   return rows[0]?.run_batch_tag ?? null;
 }
+
+// ============================================================================
+// Backtest de cartera (Fase 4 — pipeline/backtest/portfolio_report.py)
+//
+// A diferencia de getStrategySummaries/getEquityCurve arriba (que agregan
+// backtest_runs con SQL directamente en el dashboard), aquí el dashboard NO
+// recalcula nada: lee portfolio_reports.report_json, que ya trae el reporte
+// completo armado por run_full_backtest() — Sharpe/Sortino/Calmar,
+// calibración, submétricas por tipo de evento, etc. Reimplementar esas
+// fórmulas en TypeScript sería la misma trampa que evita el comentario de
+// getStrategySummaries sobre no reimplementar el bootstrap de Python aquí.
+// ============================================================================
+
+export interface PortfolioTradeMetrics {
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number | null;
+  profit_factor: number | null;
+  avg_winner: number | null;
+  avg_loser: number | null;
+  expectancy: number | null;
+  largest_win: number | null;
+  largest_loss: number | null;
+  consecutive_wins: number;
+  consecutive_losses: number;
+}
+
+export interface PortfolioEquityMetrics {
+  total_return: number | null;
+  annual_return: number | null;
+  max_drawdown: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  recovery_factor: number | null;
+  final_balance: number | null;
+}
+
+export interface PortfolioEquityPoint {
+  trade_date: string;
+  balance: number;
+}
+
+export interface EventTypeMetric {
+  event_type: string;
+  n_trades: number;
+  win_rate: number;
+  avg_return: number;
+  sharpe_per_trade: number | null;
+  insufficient_sample: boolean;
+}
+
+export interface Calibration {
+  n_trades: number;
+  mean_predicted_pct: number | null;
+  mean_actual_pct: number | null;
+  calibration_score: number | null;
+  meets_target: boolean | null;
+}
+
+export interface PredictionRegression {
+  n_trades: number;
+  r_squared: number | null;
+  scatter: { predicted: number; actual: number }[];
+}
+
+export interface AsymmetryReport {
+  n_trades: number;
+  threshold_pct?: number;
+  pct_reaching_positive_threshold: number | null;
+  pct_reaching_negative_threshold: number | null;
+  asymmetric_favoring_gains: boolean | null;
+}
+
+export interface SerializedPortfolioTrade {
+  event_id: number;
+  ticker: string | null;
+  event_class: string | null;
+  entry_date: string;
+  exit_date: string;
+  exit_reason: string;
+  pnl_pct: number;
+}
+
+export interface TemporalStability {
+  split_date: string;
+  n_trades_before: number;
+  n_trades_after: number;
+  metrics_before: PortfolioTradeMetrics;
+  metrics_after: PortfolioTradeMetrics;
+  stable: boolean | null;
+  warnings: string[];
+}
+
+export interface PortfolioVersionReport {
+  version: StrategyVersion;
+  run_batch_tag: string;
+  trade_metrics: PortfolioTradeMetrics;
+  equity_metrics: PortfolioEquityMetrics;
+  equity_curve: PortfolioEquityPoint[];
+  metrics_by_event_type: Record<string, EventTypeMetric>;
+  calibration: Calibration;
+  prediction_regression: PredictionRegression;
+  asymmetry: AsymmetryReport;
+  top_10_winners: SerializedPortfolioTrade[];
+  top_10_losers: SerializedPortfolioTrade[];
+  no_lookahead_violations: string[];
+  temporal_stability: TemporalStability | null;
+}
+
+export interface PortfolioBiasReport {
+  n_total_tickers: number;
+  n_delisted: number;
+  survivorship_bias_pct: number | null;
+  n_price_gaps: number;
+  n_price_rows: number;
+  data_gap_pct: number | null;
+}
+
+export interface PortfolioRecommendation {
+  verdict: string;
+  findings: string[];
+}
+
+export interface PortfolioReport {
+  run_batch_tag: string;
+  starting_capital: number;
+  versions: Record<StrategyVersion, PortfolioVersionReport>;
+  bias_report: PortfolioBiasReport;
+  recommendation: PortfolioRecommendation;
+}
+
+/** El run_batch_tag más reciente con un reporte de cartera guardado — igual
+ * que getLatestRunBatchTag(), pero sobre portfolio_reports (Fase 4), que es
+ * una tabla y un pipeline de escritura distintos de backtest_runs (Fase 1). */
+export async function getLatestPortfolioRunBatchTag(): Promise<string | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT run_batch_tag FROM portfolio_reports ORDER BY created_at DESC LIMIT 1`
+  );
+  return rows[0]?.run_batch_tag ?? null;
+}
+
+/** El reporte completo para un run_batch_tag — node-postgres deserializa
+ * JSONB directamente a objeto JS, así que a diferencia de getTrades() arriba
+ * no hace falta parseFloat manual: los números ya llegaron como number
+ * porque Python los serializó con json.dumps sobre floats, no NUMERIC de
+ * Postgres. */
+export async function getPortfolioReport(runBatchTag: string): Promise<PortfolioReport | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT report_json FROM portfolio_reports WHERE run_batch_tag = $1`,
+    [runBatchTag]
+  );
+  return rows[0]?.report_json ?? null;
+}

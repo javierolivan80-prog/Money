@@ -12,6 +12,7 @@ sesión por alcance (ver ese documento).
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, timedelta
 
@@ -136,13 +137,34 @@ def run_full_backtest(conn, run_batch_tag: str, starting_capital: float = 100_00
     bias_report = compute_bias_report(conn)
     recommendation = generate_recommendation(version_reports)
 
-    return {
+    report = {
         "run_batch_tag": run_batch_tag,
         "starting_capital": starting_capital,
         "versions": version_reports,
         "bias_report": bias_report,
         "recommendation": recommendation,
     }
+    _store_report(conn, run_batch_tag, report)
+    return report
+
+
+def _store_report(conn, run_batch_tag: str, report: dict) -> None:
+    """Persiste el reporte completo en portfolio_reports — así el dashboard
+    de Next.js (app/, solo lectura) lo renderiza sin reimplementar ninguna
+    fórmula de portfolio_metrics.py en TypeScript/SQL. default=str por
+    temporal_stability.split_date (un date, no serializable directo por
+    json.dumps) — el resto del árbol ya son tipos JSON nativos."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO portfolio_reports (run_batch_tag, report_json)
+            VALUES (%(tag)s, %(report)s)
+            ON CONFLICT (run_batch_tag) DO UPDATE SET
+                report_json = EXCLUDED.report_json, created_at = now()
+            """,
+            {"tag": run_batch_tag, "report": json.dumps(report, default=str)},
+        )
+    conn.commit()
 
 
 def generate_recommendation(version_reports: dict[str, dict]) -> dict:
@@ -187,11 +209,11 @@ def generate_recommendation(version_reports: dict[str, dict]) -> dict:
         else:
             missing = []
             if not passes_sharpe:
-                missing.append(f"Sharpe={sharpe}")
+                missing.append(f"Sharpe={sharpe:.2f}" if sharpe is not None else "Sharpe=None")
             if not passes_drawdown:
-                missing.append(f"max_drawdown={drawdown}")
+                missing.append(f"max_drawdown={drawdown*100:.1f}%" if drawdown is not None else "max_drawdown=None")
             if not passes_calibration:
-                missing.append(f"calibración={calibration_score}")
+                missing.append(f"calibración={calibration_score:.2f}" if calibration_score is not None else "calibración=None")
             findings.append(f"{version}: no supera todos los criterios ({', '.join(missing)})")
 
     verdict = "SÍ, con capital de prueba pequeño y solo en la(s) versión(es) que superan los 3 criterios" if any_version_passes else "NO todavía"

@@ -390,3 +390,18 @@ CREATE TABLE IF NOT EXISTS portfolio_equity_curve (
     run_batch_tag    TEXT NOT NULL,
     PRIMARY KEY (version, trade_date, run_batch_tag)
 );
+
+-- portfolio_reports: el reporte JSON completo que arma
+-- backtest/portfolio_report.py:run_full_backtest() (métricas, submétricas
+-- por tipo de evento, calibración, regresión, top 10, sesgos, y la
+-- recomendación final), una fila por run_batch_tag. Existe para que el
+-- dashboard de Next.js (app/, de solo lectura) pueda RENDERIZAR el reporte
+-- sin reimplementar en TypeScript/SQL las fórmulas de Sharpe/Sortino/
+-- Calmar/calibración que ya viven en pipeline/backtest/portfolio_metrics.py
+-- — el mismo principio que ya señalaba app/lib/queries.ts sobre no
+-- duplicar el bootstrap de backtester.py del lado del dashboard.
+CREATE TABLE IF NOT EXISTS portfolio_reports (
+    run_batch_tag   TEXT PRIMARY KEY,
+    report_json     JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
