@@ -1,0 +1,130 @@
+# nightly_pipeline.yml — batch nocturno del POC.
+#
+# POR QUÉ ESTO EXISTE (ver AUDIT_LEAN.md §1.5 y RUNBOOK.md): el pipeline
+# necesita salida a internet hacia SEC EDGAR, openFDA, Yahoo Finance y la Ken
+# French Data Library. Ningún sandbox de desarrollo de Claude Code tiene esa
+# salida (política de egress de la organización). Los runners de GitHub
+# Actions SÍ tienen salida a internet completa por defecto — así que el
+# pipeline vive aquí, no en un sandbox de desarrollo ni en un servidor propio.
+#
+# Esto también encaja con el diseño: todo el sistema es un batch nocturno
+# (ARCHITECTURE_LEAN.md §2.5 — la entrada nunca es antes de D+1), así que un
+# cron de GitHub Actions es toda la infraestructura de orquestación que hace
+# falta. Nada de Airflow, nada de un servidor siempre encendido.
+#
+# Requiere estos secrets del repo (ver RUNBOOK.md para cómo obtenerlos):
+#   DATABASE_URL        — Postgres alojado (Neon/Supabase free tier)
+#   ANTHROPIC_API_KEY    — para pipeline/analyze/adversarial_analyzer.py
+#   EDGAR_USER_AGENT      — "Tu Nombre tu@email.com" (la SEC lo exige)
+
+name: Nightly Pipeline
+
+on:
+  schedule:
+    # 02:00 ET = 06:00 UTC en horario estándar, 07:00 UTC en horario de verano.
+    # Se fija a 06:00 UTC (más simple); el desfase de una hora en DST no
+    # importa para un batch nocturno con margen de horas hasta la apertura.
+    - cron: "0 6 * * 2-6"  # martes a sábado UTC = tras el cierre de mercado de lunes a viernes ET
+  workflow_dispatch:        # permite lanzarlo a mano desde la pestaña Actions
+    inputs:
+      single_day:
+        description: "Verificación manual de un solo día (YYYY-MM-DD), en vez del incremental normal"
+        required: false
+        default: ""
+
+jobs:
+  # Job separado para correr los tests contra un Postgres efímero de servicio,
+  # en cada push Y antes de cada corrida nocturna — nunca se ingiere sobre un
+  # esquema no verificado.
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: money_poc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r pipeline/requirements.txt
+      - name: Run test suite (incluye T1 placebo y T2 réplica — bloqueantes)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/money_poc_test
+        run: python -m pytest pipeline/tests/ -v
+
+  ingest_and_analyze:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r pipeline/requirements.txt
+
+      - name: Aplicar schema (idempotente)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -c "from pipeline.db.connection import get_connection, init_schema; init_schema(get_connection())"
+
+      - name: Ingesta EDGAR (incremental — solo el día anterior salvo workflow_dispatch)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+        run: |
+          if [ -n "${{ github.event.inputs.single_day }}" ]; then
+            python -m pipeline.ingest.edgar_scraper --start "${{ github.event.inputs.single_day }}" --end "${{ github.event.inputs.single_day }}"
+          else
+            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+            python -m pipeline.ingest.edgar_scraper --start "$YESTERDAY" --end "$YESTERDAY"
+          fi
+
+      - name: Ingesta factores Fama-French (barato, se puede refrescar cada noche)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.ingest.fama_french
+
+      - name: Análisis adversarial (Bull/Bear/Judge) de eventos nuevos
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m pipeline.analyze.adversarial_analyzer --smoke-test 50
+
+  # El backfill de precios (yfinance) va en un job SEPARADO, manual, no en el
+  # cron nocturno normal: es la etapa lenta y frágil (ARCHITECTURE_LEAN.md §7)
+  # y solo hace falta ejecutarla una vez para el histórico, más incrementos
+  # pequeños después. Lanzar con workflow_dispatch cuando haga falta.
+  price_backfill_manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r pipeline/requirements.txt
+      - name: Backfill de precios (universo desde la tabla universe)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -c "
+          from pipeline.db.connection import get_connection
+          conn = get_connection()
+          with conn.cursor() as cur:
+              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
+              tickers = [r['ticker'] for r in cur.fetchall()]
+          with open('/tmp/tickers.txt', 'w') as f:
+              f.write('\n'.join(tickers))
+          print(f'{len(tickers)} tickers a descargar')
+          "
+          python -m pipeline.ingest.yfinance_backfill --tickers /tmp/tickers.txt

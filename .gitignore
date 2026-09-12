@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Caché local del pipeline (se regenera; nunca debe llevar secretos)
+pipeline/ingest/.cache_company_tickers.json
+
+# Entorno
+.env
+*.local
+
+# SO / editores
+.DS_Store
