@@ -120,6 +120,16 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python -m pipeline.analyze.event_analysis_pipeline
 
+      - name: Backtest de cartera (3 versiones — portfolio_simulator.py)
+        # Corre las 3 versiones sobre TODOS los eventos con trade_decision de
+        # event_analyses. Es acumulativo por diseño de simulate_portfolio
+        # (usa fetch_events_for_version, no filtra por "nuevos desde ayer"),
+        # así que reejecutarlo cada noche recalcula la cartera completa con
+        # el run_batch_tag del día — no es incremental como los pasos previos.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.backtest.portfolio_report
+
   # El backfill de precios (yfinance) va en un job SEPARADO, manual, no en el
   # cron nocturno normal: es la etapa lenta y frágil (ARCHITECTURE_LEAN.md §7)
   # y solo hace falta ejecutarla una vez para el histórico, más incrementos

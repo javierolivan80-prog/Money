@@ -170,6 +170,7 @@ def test_price_gap_detection_flags_missing_trading_days(conn):
     dates_present = pd.to_datetime(["2024-03-11", "2024-03-12", "2024-03-14", "2024-03-15"])  # falta el 13 (miércoles)
     df = pd.DataFrame(
         {
+            "Open": [9.9, 10.4, 10.9, 11.1],    # añadida en el backtest de cartera (entrada = apertura D+1)
             "Close": [10.0, 10.5, 11.0, 11.2],
             "Adj Close": [9.5, 10.0, 10.5, 10.7],
             "High": [10.2, 10.7, 11.3, 11.4],   # añadidas en Fase 2 (proxy de spread — ver schema.sql)

@@ -117,6 +117,12 @@ ALTER TABLE prices ADD COLUMN IF NOT EXISTS low_raw NUMERIC;   -- (high-low)/clo
                                                                 -- (AUDIT_LEAN.md §2.1). Proxy
                                                                 -- documentado, no ocultado.
 
+-- Añadida para el backtest de cartera (backtest/portfolio_simulator.py):
+-- la entrada real es "apertura D+1", y hasta ahora `prices` solo guardaba
+-- close/high/low — ningún backfill había pedido nunca el precio de apertura
+-- porque compute_car() y el backtest simple de la Fase 1 solo usan cierres.
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS open_raw NUMERIC;
+
 -- ============================================================================
 -- fama_french_factors: panel diario de factores (Ken French Data Library).
 -- ============================================================================
@@ -294,4 +300,93 @@ CREATE TABLE IF NOT EXISTS placebo_runs (
     car_20d                NUMERIC,
     run_batch_tag           TEXT NOT NULL,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- portfolio_trades / portfolio_equity_curve: backtest de cartera con gestión
+-- de riesgo real (backtest/portfolio_simulator.py) — distinto de
+-- backtest_runs (Fase 1), que sigue existiendo y sigue siendo necesario: son
+-- dos preguntas distintas (ver AUDIT_LEAN.md §2.2.3 y ARCHITECTURE_LEAN.md §8):
+--   - backtest_runs / compute_car(): ¿existe un efecto estadístico? Ventana
+--     fija D+1→D+5/D+20, sin gestión de posición — es lo que sostiene T1/T2
+--     (placebo y réplica). NO SE TOCA.
+--   - portfolio_trades: si de verdad se operara esto con sizing, stops y
+--     límites de concurrencia, ¿qué equity curve y qué métricas de riesgo
+--     resultarían? Bucle diario con TP/SL/trailing/max-holding real.
+--
+-- Una posición con trailing stop que cierra en varios tramos (30% aquí, 30%
+-- allá) se consolida en UNA fila por posición, no una fila por tramo: el
+-- spec pide un registro por trade con un solo entry/exit, así que exit_price
+-- y pnl_pct son el promedio ponderado de los tramos, y exit_date es la
+-- fecha del último tramo (posición totalmente cerrada). Ver portfolio_simulator.py.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS portfolio_trades (
+    trade_id               BIGSERIAL PRIMARY KEY,
+    event_id               BIGINT NOT NULL REFERENCES events(event_id),
+    version                TEXT NOT NULL CHECK (version IN ('CONSERVATIVE', 'AGGRESSIVE', 'BALANCED')),
+    -- Para BALANCED, cada trade se ejecuta con las reglas de Conservative O
+    -- Aggressive (ver portfolio_strategies.py:classify_balanced_execution_style) —
+    -- execution_style registra cuál, para poder auditar la mezcla real.
+    execution_style         TEXT NOT NULL CHECK (execution_style IN ('CONSERVATIVE', 'AGGRESSIVE')),
+    direction               TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+    entry_date              DATE NOT NULL,
+    entry_price             NUMERIC NOT NULL,
+    exit_date               DATE NOT NULL,
+    exit_price              NUMERIC NOT NULL,
+    exit_reason             TEXT NOT NULL CHECK (exit_reason IN ('TAKE_PROFIT', 'STOP_LOSS', 'MAX_HOLDING', 'TRAILING_STOP')),
+    pnl_pct                 NUMERIC NOT NULL,      -- retorno neto de comisiones, con signo
+    pnl_abs                 NUMERIC NOT NULL,      -- en $ sobre el tamaño de posición asignado
+    position_size_pct       NUMERIC NOT NULL,      -- % de la cartera en el momento de la entrada
+    position_size_dollars   NUMERIC NOT NULL,
+    confidence              NUMERIC NOT NULL,       -- confidence_in_conviction del Judge, en la decisión
+    ev                      NUMERIC NOT NULL,        -- ev_{version} usado para el umbral de entrada
+    prediction              NUMERIC NOT NULL,        -- net_conviction del Judge (dirección + fuerza)
+    actual_move_pct         NUMERIC NOT NULL,        -- retorno real del SUBYACENTE entry->exit (puede
+                                                      -- diferir de pnl_pct: pnl_pct ya lleva comisiones
+                                                      -- y el efecto de cierres parciales por trailing stop)
+    had_survivorship_warning BOOLEAN NOT NULL DEFAULT FALSE,
+    run_batch_tag            TEXT NOT NULL,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Checksums anti-look-ahead (spec Fase Backtesting): la entrada nunca es
+    -- D0, y la salida nunca es anterior o igual a la entrada.
+    CONSTRAINT chk_portfolio_no_lookahead CHECK (exit_date > entry_date),
+    -- Sin esto, reejecutar simulate_portfolio() con el MISMO run_batch_tag
+    -- (ej. un re-disparo manual del workflow el mismo día) duplicaría cada
+    -- trade — mismo patrón que backtest_runs (Fase 1), que sí lo tenía desde
+    -- el principio; se encontró la falta al revisar la idempotencia antes
+    -- de cablear esto al cron nocturno.
+    UNIQUE (event_id, version, run_batch_tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_trades_version_tag ON portfolio_trades (version, run_batch_tag);
+CREATE INDEX IF NOT EXISTS idx_portfolio_trades_event ON portfolio_trades (event_id);
+
+-- La UNIQUE de arriba (dentro del CREATE TABLE) solo llega a una instalación
+-- NUEVA — CREATE TABLE IF NOT EXISTS es un no-op sobre una tabla que ya
+-- existe, y a diferencia de una columna, Postgres no soporta
+-- "ADD CONSTRAINT IF NOT EXISTS" de forma nativa. Se encontró exactamente
+-- este caso al añadir la constraint sobre el Postgres de esta sesión, que ya
+-- tenía portfolio_trades de antes: un bloque DO condicional es la forma
+-- correcta de hacerlo idempotente (misma lección que high_raw/low_raw y
+-- filing_text — ver más arriba en este fichero).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'portfolio_trades_event_id_version_run_batch_tag_key'
+    ) THEN
+        ALTER TABLE portfolio_trades ADD CONSTRAINT portfolio_trades_event_id_version_run_batch_tag_key
+            UNIQUE (event_id, version, run_batch_tag);
+    END IF;
+END $$;
+
+-- Curva de equity DIARIA (no solo en días de trade): balance = cash +
+-- valor a mercado de las posiciones abiertas ese día, marcado con el cierre
+-- del día. Es lo que pide el spec ("Plotea balance(date) para 5 años").
+CREATE TABLE IF NOT EXISTS portfolio_equity_curve (
+    version         TEXT NOT NULL CHECK (version IN ('CONSERVATIVE', 'AGGRESSIVE', 'BALANCED')),
+    trade_date      DATE NOT NULL,
+    balance         NUMERIC NOT NULL,
+    n_open_positions INT NOT NULL DEFAULT 0,
+    run_batch_tag    TEXT NOT NULL,
+    PRIMARY KEY (version, trade_date, run_batch_tag)
 );

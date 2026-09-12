@@ -135,11 +135,17 @@ def _store_with_gap_detection(conn, ticker: str, df: pd.DataFrame, expected_days
             # petición adicional.
             high_raw = float(row["High"])
             low_raw = float(row["Low"])
+            # open_raw añadido para el backtest de cartera
+            # (backtest/portfolio_simulator.py): la entrada real es "apertura
+            # D+1" — ningún backfill anterior había pedido este precio porque
+            # compute_car() y el backtest simple de la Fase 1 solo usan cierres.
+            open_raw = float(row["Open"])
             cur.execute(
                 """
-                INSERT INTO prices (ticker, trade_date, close_raw, high_raw, low_raw, adj_factor, volume, survivorship_warning)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+                INSERT INTO prices (ticker, trade_date, open_raw, close_raw, high_raw, low_raw, adj_factor, volume, survivorship_warning)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                 ON CONFLICT (ticker, trade_date) DO UPDATE SET
+                    open_raw = EXCLUDED.open_raw,
                     close_raw = EXCLUDED.close_raw,
                     high_raw = EXCLUDED.high_raw,
                     low_raw = EXCLUDED.low_raw,
@@ -147,7 +153,7 @@ def _store_with_gap_detection(conn, ticker: str, df: pd.DataFrame, expected_days
                     volume = EXCLUDED.volume,
                     captured_at = now()
                 """,
-                (ticker, d, close_raw, high_raw, low_raw, adj_factor, int(row["Volume"])),
+                (ticker, d, open_raw, close_raw, high_raw, low_raw, adj_factor, int(row["Volume"])),
             )
         # Días esperados dentro del rango de ESTE ticker que no vinieron en absoluto:
         # se marcan como huecos sin inventar una fila de precio.

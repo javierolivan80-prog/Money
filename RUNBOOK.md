@@ -22,16 +22,19 @@ Actions es toda la orquestación que hace falta.
 
 **Qué SÍ se validó en esta sesión, y cómo** (para que sepas qué confianza dar
 a cada pieza):
-- Los **148 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
-  Fase 3), incluyendo decenas contra un **Postgres 16 real** levantado en
-  este sandbox (no un mock) — schema, upserts idempotentes, CHECK constraints
-  anti-look-ahead, detección de gaps de supervivencia, la caché de 24h de
-  Bull/Bear/Judge, el filtro anti-look-ahead de análogos históricos y de
-  filings previos (guidance/rumor), y un test de integración de extremo a
-  extremo de las 8 etapas (enrichment → novelty → Bull/Bear/Judge → impact →
-  EV → abstención → persistencia) con un cliente de Anthropic simulado —
-  incluida la variante con texto real de filing fluyendo hasta el prompt de
-  Bull/Bear y hasta `novelty_reasoning`.
+- Los **228 tests** de `pipeline/tests/` pasan (39 Fase 1 + 73 Fase 2 + 36
+  Fase 3 + 80 Fase 4/backtest de cartera), incluyendo decenas contra un
+  **Postgres 16 real** levantado en este sandbox (no un mock) — schema,
+  upserts idempotentes, CHECK constraints anti-look-ahead, detección de gaps
+  de supervivencia, la caché de 24h de Bull/Bear/Judge, el filtro
+  anti-look-ahead de análogos históricos y de filings previos
+  (guidance/rumor), un test de integración de extremo a extremo de las 8
+  etapas de análisis (enrichment → novelty → Bull/Bear/Judge → impact → EV →
+  abstención → persistencia) con un cliente de Anthropic simulado, y (Fase 4)
+  el backtest de cartera completo (3 versiones, TP/SL/trailing stop,
+  max_concurrent, curva de equity, ~15 métricas) verificado con precios
+  sintéticos diseñados para disparar cada mecanismo de salida al menos una
+  vez, más la reconciliación exacta de caja.
 - El motor de backtest pasó **T1 (placebo)** y una réplica sintética de
   **T2** con datos generados, no reales — ver `ARCHITECTURE_LEAN.md` §8 para
   qué significa cada uno.
@@ -228,6 +231,64 @@ recomendación de qué umbral tocar en `ev_engine.EV_THRESHOLDS` — pero
 auto-ajustar umbrales mirando la salida de la misma corrida que se evalúa es
 el tipo de sobreajuste que `AUDIT_LEAN.md` prohíbe explícitamente).
 
+### 3.9 Backtest de cartera (spec "Fase 3 — Backtesting", Etapas de simulación)
+
+Nombrado "Fase 3" en el spec de backtesting que lo pidió, pero es la **Fase 4**
+en la numeración de este repo (la Fase 3 ya la ocupa la extracción de texto de
+filings, §3.4-§3.5) — se usa "Fase 4" en el resto de esta sección para no
+confundir los dos.
+
+Requiere que `event_analyses` tenga filas con `trade_decision_* != 'NO_TRADE'`
+(Fase 2/3.8) y precios con `open_raw` (yfinance_backfill.py ya lo descarga —
+ver §3.6 más arriba). Corre las 3 versiones (Conservative/Aggressive/Balanced)
+y escribe en `portfolio_trades` + `portfolio_equity_curve`:
+
+```bash
+python -m pipeline.backtest.portfolio_report
+```
+
+Esto imprime la recomendación final y las métricas de cada versión. Para el
+reporte completo en JSON (curvas de equity, submétricas por tipo de evento,
+calibración, top 10 ganadores/perdedores, scatter predicho-vs-real):
+
+```bash
+python -c "
+from pipeline.db.connection import get_connection
+from pipeline.backtest.portfolio_report import run_full_backtest
+import json
+report = run_full_backtest(get_connection(), run_batch_tag='manual-check')
+print(json.dumps(report, indent=2, default=str))
+"
+```
+
+**Antes de confiar en cualquier número de aquí**, revisa
+`report['versions'][version]['no_lookahead_violations']` — si esa lista no
+está vacía, el resultado de esa versión no es de fiar (ver
+`backtest/portfolio_validation.py`). El `run_full_backtest` no aborta si hay
+violaciones (para que puedas ver TODAS las de una vez), pero
+`generate_recommendation()` sí las trata como bloqueantes: cualquier versión
+con violaciones nunca puede recibir un "SÍ" en el veredicto final.
+
+**Lo que este módulo NO genera**: imágenes de gráficos (equity curves, el
+scatter de calibración). Devuelve los datos estructurados que un dashboard
+necesitaría para dibujarlos — extender `app/` (el dashboard de Next.js de la
+Fase 1) para consumir `run_full_backtest()` es el siguiente paso natural, no
+hecho en esta sesión por alcance (ver §6).
+
+**Ambigüedades del spec, resueltas y documentadas en el código, no aquí en
+detalle** — ver las cabeceras de módulo para el razonamiento completo:
+- `portfolio_strategies.py`: el take-profit de Conservative ("+2% o +3%"),
+  el patrón de tramos del trailing stop de Aggressive ("+20%→30%, etc."), y
+  cómo Balanced decide qué trade ejecuta con reglas de Conservative vs
+  Aggressive.
+- `portfolio_simulator.py`: qué gana cuando un stop-loss y un take-profit se
+  cruzan el mismo día (gana el stop-loss, convención conservadora), y cómo
+  se consolida una posición con cierres parciales por trailing stop en una
+  sola fila de `portfolio_trades`.
+- `portfolio_metrics.py`: la fórmula de calibración es literal del spec
+  (`1 - |predicho-real|/|predicho|`) y puede salir fuera de [0,1] — no se
+  recorta, se reporta tal cual.
+
 ## 4. Desplegar el dashboard
 
 ```bash
@@ -252,8 +313,8 @@ URL, y `cd app && npm install && npm run dev`.
 | 3 | Factores FF3, verificar `universe` con deslistados | |
 | 4 | `populate_car_results.py` sobre eventos reales, luego `event_analysis_pipeline.py` (Fase 2) | |
 | 5 | **T1 y T2 con datos reales** (aquí solo se validaron con datos sintéticos) | Bloqueante — no seguir sin esto |
-| 6 | Pre-registro commiteado → backtest in-sample → una sola pasada OOS | |
-| 7 | Dashboard con datos reales, conclusiones | |
+| 6 | Pre-registro commiteado → `portfolio_report.py` (Fase 4, backtest de cartera) → una sola pasada OOS | |
+| 7 | Dashboard con datos reales (extender `app/` para el reporte de la Fase 4 — ver §6), conclusiones | |
 
 ## 6. Lo que este commit NO incluye (y por qué)
 
@@ -287,9 +348,22 @@ URL, y `cd app && npm install && npm run dev`.
   guidance/rumor sobre ese texto tampoco existen todavía. Todo lo demás de
   la Fase 3 (Bull/Bear con texto real, novelty con guidance/rumor) funciona
   igual de bien para EDGAR sin esperar a esto.
+- **El dashboard de Next.js no consume el backtest de cartera (Fase 4)**:
+  `backtest/portfolio_report.py` devuelve todos los datos que pide el spec
+  ("OUTPUTS DAY 4-5" — curvas de equity, tablas de métricas, submétricas por
+  tipo de evento, scatter predicho-vs-real, top 10 ganadores/perdedores) como
+  JSON estructurado, pero `app/` (el dashboard de la Fase 1, que hoy muestra
+  el backtest simple de `backtest_runs`) no tiene todavía las páginas para
+  visualizarlo. Es una extensión directa del mismo patrón que ya usa
+  `StrategyColumn.tsx`/`EquityCurve.tsx` — no un cambio de diseño — pero no
+  se ha hecho en esta sesión por alcance: el motor de simulación, las
+  métricas, y las validaciones ya eran un bloque de trabajo grande por sí
+  solo. Sin esto, para ver los resultados de la Fase 4 hay que consultar
+  `portfolio_trades`/`portfolio_equity_curve` a mano o correr
+  `portfolio_report.py` desde la línea de comandos (§3.9).
 
 Ninguna de estas ausencias es una limitación de diseño — son, literalmente,
 las partes que necesitan datos reales (EDGAR, FDA, o el texto de filings ya
 descargados) que este sandbox no puede obtener para escribir contra ellas
-con confianza. Escribirlas a ciegas habría sido peor que dejarlas explícitas
-aquí.
+con confianza, o trabajo de UI que quedó fuera del alcance de esta sesión.
+Escribirlas a ciegas habría sido peor que dejarlas explícitas aquí.
