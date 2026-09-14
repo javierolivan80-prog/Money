@@ -21,10 +21,24 @@ name: Nightly Pipeline
 
 on:
   schedule:
-    # 02:00 ET = 06:00 UTC en horario estándar, 07:00 UTC en horario de verano.
-    # Se fija a 06:00 UTC (más simple); el desfase de una hora en DST no
-    # importa para un batch nocturno con margen de horas hasta la apertura.
-    - cron: "0 6 * * 2-6"  # martes a sábado UTC = tras el cierre de mercado de lunes a viernes ET
+    # TRES pasadas al día. GitHub Actions interpreta el cron SIEMPRE en UTC y
+    # no entiende de horario de verano, así que las horas se eligen para que
+    # sigan siendo válidas tanto en EDT (UTC-4, verano) como en EST (UTC-5,
+    # invierno) — en vez de acertar en una mitad del año y fallar en la otra.
+    #
+    # Mercado (NYSE/NASDAQ): abre 9:30 ET, cierra 16:00 ET.
+    - cron: "30 14 * * 1-5"  # TRAS LA APERTURA  — 10:30 ET en verano, 9:30 ET en invierno
+    - cron: "30 21 * * 1-5"  # TRAS EL CIERRE    — 17:30 ET en verano, 16:30 ET en invierno
+    - cron: "0 6 * * 2-6"    # NOCHE (la pasada completa) — 2:00 ET en verano, 1:00 ET en invierno
+    #
+    # Las dos pasadas intradía son LIGERAS a propósito: solo ingestan filings
+    # nuevos y recalculan el análisis. Los pasos caros y frágiles (precios de
+    # yfinance, cuentas XBRL de cientos de empresas) corren UNA vez al día, en
+    # la pasada nocturna — ver la condición `if` de cada paso. Correrlos tres
+    # veces no aportaría datos nuevos (los precios diarios no cambian
+    # intradía) y triplicaría el riesgo de tropezar con los límites de
+    # yfinance, que ya es la etapa más frágil del pipeline
+    # (ARCHITECTURE_LEAN.md §7).
   workflow_dispatch:        # permite lanzarlo a mano desde la pestaña Actions
     inputs:
       single_day:
@@ -85,7 +99,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -c "from pipeline.db.connection import get_connection, init_schema; init_schema(get_connection())"
 
-      - name: Ingesta EDGAR (incremental — solo el día anterior salvo workflow_dispatch)
+      - name: Ingesta EDGAR (incremental — ayer y hoy, o el rango de backfill)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
@@ -99,7 +113,15 @@ jobs:
           elif [ -n "${{ github.event.inputs.single_day }}" ]; then
             python -m pipeline.ingest.edgar_scraper --start "${{ github.event.inputs.single_day }}" --end "${{ github.event.inputs.single_day }}"
           else
-            python -m pipeline.ingest.edgar_scraper --start "$YESTERDAY" --end "$YESTERDAY"
+            # AYER y HOY, no solo ayer: con tres pasadas al día, pedir siempre
+            # "ayer" haría que las dos intradía no trajeran absolutamente nada
+            # nuevo. Incluir hoy es lo que permite que un 8-K presentado esta
+            # mañana se detecte tras la apertura en vez de mañana de
+            # madrugada. Reingestar ayer no duplica nada: upsert_events hace
+            # ON CONFLICT DO NOTHING sobre (source, accession_number,
+            # event_class).
+            TODAY=$(date -u +%Y-%m-%d)
+            python -m pipeline.ingest.edgar_scraper --start "$YESTERDAY" --end "$TODAY"
           fi
 
       - name: Backfill de precios del universo recién ingestado (solo en backfill)
@@ -137,6 +159,46 @@ jobs:
           echo "Precios: $PRICE_START -> $PRICE_END"
           python -m pipeline.ingest.yfinance_backfill --tickers /tmp/tickers.txt --start "$PRICE_START" --end "$PRICE_END"
 
+      - name: Actualizar precios del universo (solo en la pasada nocturna)
+        # BUG QUE ESTO CORRIGE: hasta ahora NINGUNA pasada programada
+        # descargaba precios — price_backfill_manual solo corre con
+        # workflow_dispatch. Sin esto, los precios de D+1..D+20 POSTERIORES a
+        # cada evento no llegaban nunca, así que compute_car() se quedaba sin
+        # poder cerrar ningún evento reciente y el backtest nunca acumulaba
+        # trades por mucho que el pipeline corriese cada noche.
+        #
+        # Ventana de 500 días naturales hacia atrás, no solo los últimos días:
+        # cada evento nuevo puede traer un ticker que el universo no tenía, y
+        # ese ticker necesita los 250 DÍAS DE MERCADO de ventana de estimación
+        # que pide el modelo de factores. Con una ventana corta, el CAR de las
+        # empresas nuevas fallaría en silencio.
+        #
+        # Solo en la pasada nocturna (y en las manuales): yfinance es la etapa
+        # lenta y frágil del pipeline (ARCHITECTURE_LEAN.md §7) y los precios
+        # DIARIOS no cambian entre la apertura y el cierre.
+        if: github.event.schedule != '30 14 * * 1-5' && github.event.schedule != '30 21 * * 1-5' && github.event.inputs.backfill_start == ''
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -c "
+          from pipeline.db.connection import get_connection
+          conn = get_connection()
+          with conn.cursor() as cur:
+              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
+              tickers = [r['ticker'] for r in cur.fetchall()]
+          with open('/tmp/tickers.txt', 'w') as f:
+              f.write('\n'.join(tickers))
+          print(f'{len(tickers)} tickers en el universo')
+          " | tee /tmp/ticker_count.txt
+          if [ -s /tmp/tickers.txt ]; then
+            PRICE_START=$(date -u -d "500 days ago" +%Y-%m-%d)
+            PRICE_END=$(date -u +%Y-%m-%d)
+            echo "Precios: $PRICE_START -> $PRICE_END"
+            python -m pipeline.ingest.yfinance_backfill --tickers /tmp/tickers.txt --start "$PRICE_START" --end "$PRICE_END"
+          else
+            echo "Universo vacío todavía — nada que descargar"
+          fi
+
       - name: Extraer texto de filings pendientes (Fase 3 — insumo de Bull/Bear/novelty)
         # Va justo después de la ingesta EDGAR y ANTES del análisis: sin esto,
         # adversarial_analyzer.py degrada al placeholder y novelty.py no puede
@@ -155,6 +217,11 @@ jobs:
         # Insumo del análisis fundamental: los mismos números que venden los
         # proveedores de pago, publicados gratis por la SEC en XBRL. Un fallo
         # por empresa no aborta el resto (ver ingest_universe_fundamentals).
+        #
+        # Solo en la pasada nocturna: es una petición HTTP por empresa del
+        # universo entero, y las cuentas anuales cambian cuatro veces al año,
+        # no tres veces al día.
+        if: github.event.schedule != '30 14 * * 1-5' && github.event.schedule != '30 21 * * 1-5'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
@@ -163,7 +230,8 @@ jobs:
       - name: Notas de calidad de negocio (análisis fundamental)
         # Va DESPUÉS de la ingesta de cuentas y del backfill de precios:
         # necesita ambas (las cuentas para los 4 criterios de negocio, el
-        # precio para el de valoración).
+        # precio para el de valoración). Solo nocturna, como su insumo.
+        if: github.event.schedule != '30 14 * * 1-5' && github.event.schedule != '30 21 * * 1-5'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.analyze.quality_score
