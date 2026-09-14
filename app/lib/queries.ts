@@ -305,6 +305,73 @@ export interface SignalFeedFilters {
   limit?: number;
 }
 
+// Formas exactas de los campos JSONB de event_analyses — deben mantenerse en
+// sincronía con los schemas/as_json() de pipeline/analyze/*.py (ver ahí para
+// el porqué de cada campo). Sin esto, el dashboard solo puede mostrar los
+// pocos campos que ya tenía columna propia — el resto del razonamiento
+// (por qué NO_TRADE, qué dijo Bear, cuántos análogos había) queda calculado
+// pero invisible, que es justo el hueco que esto cierra.
+export interface BullOutput {
+  thesis: string;
+  upside_drivers: string[];
+  addressable_market: string;
+  comparable_events: string;
+  catalysts_forward: string[];
+}
+
+export interface BearOutput {
+  counter_thesis: string;
+  downside_risks: string[];
+  valuation_concern: string;
+  historical_precedent: string;
+  negative_catalysts: string[];
+}
+
+export interface JudgeOutput {
+  net_conviction: number;
+  confidence_in_conviction: number;
+  key_uncertainty: string;
+  overriding_concern: string;
+}
+
+export interface NoveltyReasoning {
+  score: number;
+  components_used: string[];
+  components_unavailable: string[];
+  [key: string]: unknown; // reasoning dict de novelty.py se aplana aquí (drift_pct, etc.)
+}
+
+export interface ImpactEstimation {
+  probability_5pct_move: number;
+  probability_10pct_move: number;
+  probability_20pct_move: number;
+  expected_direction: number;
+  expected_magnitude: string; // "±X.XX% según histórico de N eventos análogos"
+  volatility_increase: number;
+  confidence: number;
+}
+
+export interface EvCalculation {
+  ev_conservative: number;
+  ev_aggressive: number;
+  ev_balanced: number;
+  position_sizing_conservative: string;
+  position_sizing_aggressive: string;
+  position_sizing_balanced: string;
+  threshold_conservative: string;
+  threshold_aggressive: string;
+  threshold_balanced: string;
+  reasoning: string;
+}
+
+export interface AbstentionPerStrategy {
+  trade_decision: "LONG" | "SHORT" | "NO_TRADE";
+  reason_if_no_trade: string | null;
+  confidence: number;
+}
+
+export type AbstentionDecision = Record<"CONSERVATIVE" | "BALANCED" | "AGGRESSIVE", AbstentionPerStrategy>;
+
 export interface SignalFeedRow {
   event_id: number;
   ticker: string;
@@ -312,9 +379,14 @@ export interface SignalFeedRow {
   source: string;
   d0_close_date: string;
   novelty_score: number;
-  bull_output: unknown;
-  bear_output: unknown;
-  judge_output: unknown;
+  novelty_reasoning: NoveltyReasoning | null;
+  bull_output: BullOutput | null;
+  bear_output: BearOutput | null;
+  judge_output: JudgeOutput | null;
+  impact_estimation: ImpactEstimation | null;
+  n_historical_analogues: number | null;
+  ev_calculation: EvCalculation | null;
+  abstention_decision: AbstentionDecision | null;
   net_conviction: number;
   confidence: number;
   ev_balanced: number;
@@ -372,8 +444,9 @@ export async function getSignalsFeed(filters: SignalFeedFilters): Promise<Signal
     SELECT * FROM (
       SELECT
         e.event_id, e.ticker, e.event_class, e.source, e.d0_close_date,
-        ea.novelty_score, ea.bull_analyst_output AS bull_output, ea.bear_analyst_output AS bear_output,
-        ea.judge_output, ea.net_conviction, ea.confidence_in_conviction AS confidence, ea.ev_balanced,
+        ea.novelty_score, ea.novelty_reasoning, ea.bull_analyst_output AS bull_output, ea.bear_analyst_output AS bear_output,
+        ea.judge_output, ea.impact_estimation, ea.n_historical_analogues, ea.ev_calculation, ea.abstention_decision,
+        ea.net_conviction, ea.confidence_in_conviction AS confidence, ea.ev_balanced,
         ea.trade_decision_conservative, ea.trade_decision_aggressive, ea.trade_decision_balanced,
         (CASE
           WHEN ea.trade_decision_conservative = 'NO_TRADE' AND ea.trade_decision_aggressive = 'NO_TRADE'
@@ -400,9 +473,14 @@ export async function getSignalsFeed(filters: SignalFeedFilters): Promise<Signal
     source: r.source,
     d0_close_date: r.d0_close_date instanceof Date ? r.d0_close_date.toISOString().slice(0, 10) : r.d0_close_date,
     novelty_score: r.novelty_score,
+    novelty_reasoning: r.novelty_reasoning,
     bull_output: r.bull_output,
     bear_output: r.bear_output,
     judge_output: r.judge_output,
+    impact_estimation: r.impact_estimation,
+    n_historical_analogues: r.n_historical_analogues,
+    ev_calculation: r.ev_calculation,
+    abstention_decision: r.abstention_decision,
     net_conviction: parseFloat(r.net_conviction),
     confidence: parseFloat(r.confidence),
     ev_balanced: parseFloat(r.ev_balanced),
