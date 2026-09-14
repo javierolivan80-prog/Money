@@ -10,7 +10,8 @@ import os
 # Este pipeline se ejecuta en GitHub Actions (con salida a internet completa),
 # NO en el sandbox de desarrollo, que tiene el egress bloqueado a EDGAR/FDA/
 # Yahoo Finance/Ken French por política de la organización (AUDIT_LEAN.md §1.5).
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/money_poc")
+_db_url = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/money_poc")
+DATABASE_URL = _db_url.strip() if _db_url else ""
 
 # --- Anthropic ---
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # requerido para analyze/*
