@@ -130,6 +130,18 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.backtest.portfolio_report
 
+      - name: Validación estadística (Fase 6 — event study, sensibilidad, veredicto)
+        # Reutiliza el portfolio_report que acaba de guardar el paso anterior
+        # (mismo run_batch_tag fecha+sha) — no resimula la cartera. Guarda en
+        # validation_reports (Postgres), no en docs/VALIDATION_REPORT.md: un
+        # runner de GitHub Actions es efímero y este repo no hace commits
+        # automáticos, así que un fichero escrito aquí se perdería al acabar
+        # el job (mismo motivo por el que price_backfill_manual no escribe
+        # nada a disco tampoco). Ver pipeline/validation/report.py:persist_validation_report.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.validation.report --persist-only
+
       - name: Paper trading semanal (Fase 4 — paper_trading/report.py)
         # Simula la última semana COMPLETA de datos disponibles como si
         # fuera "futura" (select_simulation_week en paper_trading/simulator.py).

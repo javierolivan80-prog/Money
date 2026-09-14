@@ -287,6 +287,72 @@ export async function getPaperTradingReport(runBatchTag: string): Promise<PaperT
 }
 
 // ============================================================================
+// Validation report (Fase 6 — pipeline/validation/report.py, persistido vía
+// persist_validation_report en validation_reports). Responde las preguntas
+// que el resto del dashboard no responde: ¿el EVENTO en sí mueve el precio
+// de forma no aleatoria? (event study, sobre TODOS los eventos, no solo los
+// operados) y ¿el resultado es frágil a supuestos de coste/latencia/régimen?
+// (sensitivity), rematado en un veredicto GREENLIGHT/YELLOWLIGHT/REDLIGHT.
+// ============================================================================
+
+export interface EventStudyClassResult {
+  n: number;
+  mean_return_pct: number | null;
+  median_return_pct: number | null;
+  p25_pct: number | null;
+  p75_pct: number | null;
+  sigma_pct: number | null;
+  mde_pct: number | null;
+  t_statistic: number | null;
+  p_value: number | null;
+  significant: boolean | null;
+  conclusion: string;
+}
+
+export type EventStudy = Record<string, EventStudyClassResult>;
+
+export interface SensitivityScenarioResult {
+  n_trades: number;
+  win_rate: number | null;
+  total_return: number | null;
+}
+
+export interface Sensitivity {
+  run_batch_tag: string;
+  scenarios: Record<"CONSERVATIVE" | "AGGRESSIVE", Record<string, SensitivityScenarioResult>>;
+}
+
+export interface VersionDecision {
+  option: "A" | "B" | "C";
+  label: string;
+  recommendation: string;
+  reasons: string[];
+}
+
+export interface ValidationReport {
+  run_batch_tag: string;
+  generated_at: string;
+  event_study: EventStudy;
+  sensitivity: Sensitivity;
+  decisions: Record<StrategyVersion, VersionDecision>;
+  best_version: StrategyVersion;
+  best_decision: VersionDecision;
+  bias_report: PortfolioBiasReport;
+}
+
+export async function getLatestValidationRunBatchTag(): Promise<string | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT run_batch_tag FROM validation_reports ORDER BY created_at DESC LIMIT 1`);
+  return rows[0]?.run_batch_tag ?? null;
+}
+
+export async function getValidationReport(runBatchTag: string): Promise<ValidationReport | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT report_json FROM validation_reports WHERE run_batch_tag = $1`, [runBatchTag]);
+  return rows[0]?.report_json ?? null;
+}
+
+// ============================================================================
 // Tab 1 "All Signals" (Fase 5) — feed cronológico de eventos analizados,
 // con o sin trade_decision, con filtros. A diferencia del resto de este
 // archivo, esta query SÍ compone datos con SQL propio (no lee un

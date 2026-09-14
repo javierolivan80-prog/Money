@@ -458,3 +458,25 @@ CREATE TABLE IF NOT EXISTS paper_trading_reports (
     report_json     JSONB NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ============================================================================
+-- validation_reports: Fase 6 (pipeline/validation/report.py) — event study,
+-- sensibilidad y veredicto GREENLIGHT/YELLOWLIGHT/REDLIGHT, persistidos en
+-- Postgres en vez de solo como docs/VALIDATION_REPORT.md.
+--
+-- Por qué esta tabla, y por qué no existía antes: el runner de GitHub
+-- Actions es efímero (ARCHITECTURE_LEAN.md §1.5) y este proyecto nunca ha
+-- hecho commits automáticos — un fichero Markdown escrito en el runner se
+-- perdía al terminar el job, así que report.py quedó documentado como "paso
+-- manual/local" y jamás corrió en el cron nocturno. Guardar el mismo
+-- payload como JSONB (mismo patrón que portfolio_reports/
+-- paper_trading_reports, que sí sobreviven porque viven en Neon, no en el
+-- runner) resuelve eso sin tocar nada del cálculo: se sigue escribiendo el
+-- .md localmente cuando se corre a mano, y ADEMÁS se persiste aquí para que
+-- el dashboard lo lea cada noche.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS validation_reports (
+    run_batch_tag   TEXT PRIMARY KEY,
+    report_json     JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

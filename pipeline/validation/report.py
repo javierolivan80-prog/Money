@@ -9,6 +9,7 @@ Mismo principio de todo el proyecto: una sola fuente de verdad por número.
 from __future__ import annotations
 
 import csv
+import json
 from datetime import date, datetime
 from pathlib import Path
 
@@ -289,6 +290,62 @@ documento (`pipeline/validation/report.py:export_trades_csv`)._
 """
 
 
+def _fetch_portfolio_report(conn, run_batch_tag: str) -> dict | None:
+    """Lee un portfolio_report ya calculado y guardado por
+    backtest/portfolio_report.py (el paso nocturno anterior en el mismo
+    run_batch_tag) en vez de resimular la cartera completa otra vez —
+    simulate_portfolio() es acumulativo y recalcula TODO el histórico, así
+    que llamarlo dos veces en la misma corrida nocturna sería el doble de
+    coste por nada nuevo."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT report_json FROM portfolio_reports WHERE run_batch_tag = %s", (run_batch_tag,))
+        row = cur.fetchone()
+    return row["report_json"] if row else None
+
+
+def persist_validation_report(conn, run_batch_tag: str) -> dict:
+    """Guarda event_study + sensitivity + decisión en validation_reports
+    (JSONB), leyendo el portfolio_report ya persistido por el paso de
+    backtest de la misma corrida en vez de recalcularlo. Pensado para el
+    cron nocturno (ver nightly_pipeline.yml) — no escribe ningún fichero,
+    solo Postgres, que es lo único que sobrevive a un runner efímero (ver
+    cabecera de la tabla validation_reports en schema.sql)."""
+    portfolio_report = _fetch_portfolio_report(conn, run_batch_tag)
+    if portfolio_report is None:
+        # Defensa: si por lo que sea no hay portfolio_report para este tag
+        # (ej. se llama fuera del flujo nocturno normal), lo calcula aquí —
+        # más caro, pero nunca deja el paso en un estado roto.
+        portfolio_report = run_full_backtest(conn, run_batch_tag=run_batch_tag)
+
+    event_study = run_event_study(conn, window_days=20)
+    sensitivity = run_sensitivity_analysis(conn, run_batch_tag=run_batch_tag)
+    decisions = evaluate_all_versions_decision(portfolio_report)
+    best_version, best_decision = overall_verdict(decisions)
+
+    payload = {
+        "run_batch_tag": run_batch_tag,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "event_study": event_study,
+        "sensitivity": sensitivity,
+        "decisions": decisions,
+        "best_version": best_version,
+        "best_decision": best_decision,
+        "bias_report": portfolio_report["bias_report"],
+    }
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO validation_reports (run_batch_tag, report_json)
+            VALUES (%(tag)s, %(report)s)
+            ON CONFLICT (run_batch_tag) DO UPDATE SET report_json = EXCLUDED.report_json, created_at = now()
+            """,
+            {"tag": run_batch_tag, "report": json.dumps(payload)},
+        )
+    conn.commit()
+    return payload
+
+
 def generate_full_validation_report(conn, run_batch_tag: str | None = None, docs_dir: str = "docs") -> dict:
     """Punto de entrada único — corre el backtest (si hace falta), el event
     study, la sensibilidad, calcula las 3 decisiones, escribe
@@ -323,13 +380,42 @@ def generate_full_validation_report(conn, run_batch_tag: str | None = None, docs
 
 
 if __name__ == "__main__":
+    import argparse
     import logging
+    import subprocess
 
     logging.basicConfig(level=logging.INFO)
     from pipeline.db.connection import get_connection
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--persist-only",
+        action="store_true",
+        help=(
+            "Para el cron nocturno: solo guarda validation_reports (Postgres), sin "
+            "recalcular el backtest ni escribir docs/VALIDATION_REPORT.md — reutiliza "
+            "el run_batch_tag y el portfolio_report que el paso de backtest de la misma "
+            "corrida ya dejó en la BD (ver persist_validation_report)."
+        ),
+    )
+    args = parser.parse_args()
+
     conn = get_connection()
-    result = generate_full_validation_report(conn)
-    print(f"Reporte escrito en {result['report_path']}")
-    print(f"CSV con {result['n_trades_exported']} trades en {result['csv_path']}")
-    print(f"Veredicto: {result['best_decision']['label']} ({result['best_version']})")
+
+    if args.persist_only:
+        # Mismo esquema de tag que backtest/portfolio_report.py:__main__ —
+        # tiene que coincidir exactamente para encontrar el portfolio_report
+        # de esta misma corrida en vez de calcular uno nuevo.
+        try:
+            git_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+        except Exception:
+            git_sha = "unknown"
+        tag = f"{date.today().isoformat()}-{git_sha}"
+        payload = persist_validation_report(conn, tag)
+        print(f"validation_reports actualizado para {tag}")
+        print(f"Veredicto: {payload['best_decision']['label']} ({payload['best_version']})")
+    else:
+        result = generate_full_validation_report(conn)
+        print(f"Reporte escrito en {result['report_path']}")
+        print(f"CSV con {result['n_trades_exported']} trades en {result['csv_path']}")
+        print(f"Veredicto: {result['best_decision']['label']} ({result['best_version']})")

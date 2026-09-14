@@ -11,6 +11,7 @@ const TABS = [
   { href: "/signals", label: "All Signals" },
   { href: "/portfolio", label: "Backtest Analysis" },
   { href: "/calibration", label: "Calibration" },
+  { href: "/validation", label: "Validation" },
   { href: "/comparison", label: "Comparison" },
   { href: "/week", label: "Signals This Week" },
 ] as const;
