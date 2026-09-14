@@ -9,6 +9,7 @@
 import { Fragment, useState } from "react";
 import { createColumnHelper, flexRender, getCoreRowModel, getPaginationRowModel, getSortedRowModel, useReactTable, type SortingState } from "@tanstack/react-table";
 import type { SignalFeedRow } from "@/lib/queries";
+import { SignalDetail } from "@/components/SignalDetail";
 
 const SIGNAL_COLORS: Record<string, string> = {
   LONG: "text-green-600 dark:text-green-400",
@@ -107,32 +108,7 @@ export function SignalsTable({ rows }: { rows: SignalFeedRow[] }) {
                     </td>
                   ))}
                 </tr>
-                {isExpanded && (
-                  <tr className="border-b border-neutral-100 dark:border-neutral-900 bg-neutral-50 dark:bg-neutral-900/50">
-                    <td colSpan={columns.length + 1} className="py-3 px-4 text-xs space-y-1">
-                      <p>
-                        <span className="font-medium text-green-700 dark:text-green-400">Bull:</span>{" "}
-                        {(row.original.bull_output as { thesis?: string })?.thesis ?? "—"}
-                      </p>
-                      <p>
-                        <span className="font-medium text-red-700 dark:text-red-400">Bear:</span>{" "}
-                        {(row.original.bear_output as { counter_thesis?: string })?.counter_thesis ?? "—"}
-                      </p>
-                      <p>
-                        <span className="font-medium">Judge:</span>{" "}
-                        {(row.original.judge_output as { overriding_concern?: string; key_uncertainty?: string })?.overriding_concern ??
-                          (row.original.judge_output as { key_uncertainty?: string })?.key_uncertainty ??
-                          "—"}
-                      </p>
-                      <p className="text-neutral-500">
-                        Decisiones por versión: CONSERVATIVE={row.original.trade_decision_conservative} · AGGRESSIVE=
-                        {row.original.trade_decision_aggressive} · BALANCED={row.original.trade_decision_balanced}
-                        {row.original.entry_date && ` · Entrada ${row.original.entry_date}`}
-                        {row.original.exit_date && ` · Salida ${row.original.exit_date} (${row.original.exit_reason})`}
-                      </p>
-                    </td>
-                  </tr>
-                )}
+                {isExpanded && <SignalDetail row={row.original} colSpan={columns.length + 1} />}
               </Fragment>
             );
           })}

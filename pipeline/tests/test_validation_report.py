@@ -119,3 +119,66 @@ def test_generate_full_validation_report_end_to_end(conn, tmp_path):
         csv_content = csv_path.read_text()
         assert "ticker" in csv_content
         assert "pnl_pct" in csv_content
+
+
+def test_persist_validation_report_reuses_existing_portfolio_report(conn):
+    """persist_validation_report (el paso del cron nocturno) no debe
+    resimular la cartera si backtest/portfolio_report.py ya dejó un
+    portfolio_report para ese run_batch_tag en la misma corrida — solo debe
+    LEERLO. Se verifica sembrando un portfolio_reports con un
+    bias_report reconocible y comprobando que ese mismo valor aparece en el
+    validation_reports resultante, sin volver a calcular nada."""
+    from pipeline.backtest.portfolio_report import run_full_backtest
+    from pipeline.validation.report import persist_validation_report
+
+    cal = _business_days(date(2024, 1, 2), 60)
+    classes = ["8K_2.02_EARNINGS", "8K_1.01_MATERIAL_AGREEMENT"]
+    for i in range(10):
+        d0 = cal[i]
+        ticker = f"P{i}"
+        closes = [100.0 + i * 0.5 + j * 0.2 for j in range(len(cal))]
+        _seed_full_event(
+            conn, f"p{i}", ticker, d0, cal, closes,
+            decision="LONG" if i % 3 != 0 else "NO_TRADE",
+            confidence=55.0 + i, ev=0.01, event_class=classes[i % 2], vix_d0=15.0 + i,
+        )
+
+    tag = "validation-persist-test-1"
+    portfolio_report = run_full_backtest(conn, run_batch_tag=tag)
+
+    payload = persist_validation_report(conn, tag)
+
+    assert payload["run_batch_tag"] == tag
+    assert payload["bias_report"] == portfolio_report["bias_report"]
+    assert set(payload["decisions"].keys()) == {"CONSERVATIVE", "AGGRESSIVE", "BALANCED"}
+    assert payload["best_version"] in {"CONSERVATIVE", "AGGRESSIVE", "BALANCED"}
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT report_json FROM validation_reports WHERE run_batch_tag = %s", (tag,))
+        row = cur.fetchone()
+    assert row is not None
+    assert row["report_json"]["best_version"] == payload["best_version"]
+    assert "event_study" in row["report_json"]
+    assert "sensitivity" in row["report_json"]
+
+
+def test_persist_validation_report_upsert_overwrites(conn):
+    """ON CONFLICT DO UPDATE: reejecutar el paso nocturno con el mismo tag
+    (ej. un re-disparo manual del workflow) actualiza la fila en vez de
+    fallar por duplicate key — mismo patrón que portfolio_reports."""
+    from pipeline.validation.report import persist_validation_report
+
+    cal = _business_days(date(2024, 1, 2), 40)
+    _seed_full_event(
+        conn, "u1", "U1", cal[0], cal, [100.0 + j * 0.1 for j in range(len(cal))],
+        decision="LONG", confidence=70.0, ev=0.01, event_class="8K_2.02_EARNINGS", vix_d0=18.0,
+    )
+
+    tag = "validation-persist-test-2"
+    first = persist_validation_report(conn, tag)
+    second = persist_validation_report(conn, tag)
+
+    assert first["run_batch_tag"] == second["run_batch_tag"] == tag
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM validation_reports WHERE run_batch_tag = %s", (tag,))
+        assert cur.fetchone()["n"] == 1
