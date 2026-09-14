@@ -31,6 +31,14 @@ on:
         description: "Verificación manual de un solo día (YYYY-MM-DD), en vez del incremental normal"
         required: false
         default: ""
+      backfill_start:
+        description: "Backfill histórico — fecha inicio (YYYY-MM-DD). Ingesta el rango entero y descarga los precios del universo resultante en la MISMA corrida"
+        required: false
+        default: ""
+      backfill_end:
+        description: "Backfill histórico — fecha fin (YYYY-MM-DD). Si se omite, hasta ayer"
+        required: false
+        default: ""
 
 jobs:
   # Job separado para correr los tests contra un Postgres efímero de servicio,
@@ -82,12 +90,52 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
         run: |
-          if [ -n "${{ github.event.inputs.single_day }}" ]; then
+          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+          if [ -n "${{ github.event.inputs.backfill_start }}" ]; then
+            END="${{ github.event.inputs.backfill_end }}"
+            [ -z "$END" ] && END="$YESTERDAY"
+            echo "Backfill histórico: ${{ github.event.inputs.backfill_start }} -> $END"
+            python -m pipeline.ingest.edgar_scraper --start "${{ github.event.inputs.backfill_start }}" --end "$END"
+          elif [ -n "${{ github.event.inputs.single_day }}" ]; then
             python -m pipeline.ingest.edgar_scraper --start "${{ github.event.inputs.single_day }}" --end "${{ github.event.inputs.single_day }}"
           else
-            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
             python -m pipeline.ingest.edgar_scraper --start "$YESTERDAY" --end "$YESTERDAY"
           fi
+
+      - name: Backfill de precios del universo recién ingestado (solo en backfill)
+        # SOLO en un backfill, y aquí dentro en vez de en el job paralelo
+        # price_backfill_manual, por una cuestión de ORDEN: ese job corre en
+        # paralelo a este, así que en un arranque en frío descargaría precios
+        # de un universo todavía vacío (se vio en el run 34869580667: los
+        # precios corrieron a las 16:35 y los eventos entraron a las 16:37).
+        # Los pasos siguientes (CAR, enrichment, backtest) necesitan precios
+        # YA cargados para los tickers que acaban de aparecer.
+        if: github.event.inputs.backfill_start != ''
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -c "
+          from pipeline.db.connection import get_connection
+          conn = get_connection()
+          with conn.cursor() as cur:
+              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
+              tickers = [r['ticker'] for r in cur.fetchall()]
+          with open('/tmp/tickers.txt', 'w') as f:
+              f.write('\n'.join(tickers))
+          print(f'{len(tickers)} tickers a descargar')
+          "
+          # Rango de precios EXPLÍCITO, no el default del script
+          # (config.BACKTEST_START/END, que termina en 2025-12-31 y dejaría sin
+          # precios cualquier evento posterior a esa fecha). Hace falta:
+          #  - hacia atrás: ~500 días naturales antes del primer evento, porque
+          #    compute_car() ajusta el modelo de factores sobre una ventana de
+          #    estimación de 250 DÍAS DE MERCADO previos al evento.
+          #  - hacia delante: hasta hoy, para tener los D+1..D+20 de los
+          #    eventos más recientes.
+          PRICE_START=$(date -u -d "${{ github.event.inputs.backfill_start }} -500 days" +%Y-%m-%d)
+          PRICE_END=$(date -u +%Y-%m-%d)
+          echo "Precios: $PRICE_START -> $PRICE_END"
+          python -m pipeline.ingest.yfinance_backfill --tickers /tmp/tickers.txt --start "$PRICE_START" --end "$PRICE_END"
 
       - name: Extraer texto de filings pendientes (Fase 3 — insumo de Bull/Bear/novelty)
         # Va justo después de la ingesta EDGAR y ANTES del análisis: sin esto,
@@ -178,7 +226,11 @@ jobs:
   # y solo hace falta ejecutarla una vez para el histórico, más incrementos
   # pequeños después. Lanzar con workflow_dispatch cuando haga falta.
   price_backfill_manual:
-    if: github.event_name == 'workflow_dispatch'
+    # Excluido durante un backfill: ese caso lo cubre el paso equivalente
+    # DENTRO de ingest_and_analyze, que sí corre en el orden correcto (después
+    # de que la ingesta de EDGAR haya poblado universe). Este job corre en
+    # paralelo, así que en un arranque en frío descargaría un universo vacío.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.backfill_start == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
