@@ -39,6 +39,65 @@ def test_parse_daily_index_extracts_correct_fields():
     assert acme["file_name"] == "edgar/data/1234567/0001234567-24-000123.txt"
 
 
+def test_parse_daily_index_con_separador_de_guiones_continuo():
+    """REGRESIÓN (bug real, 2026-09-14): el parser derivaba el corte de cada
+    columna de la línea de guiones, asumiendo tramos separados por columna
+    ('---- ---- ----'). Con una TIRA CONTINUA de guiones esa lógica colapsaba
+    a una sola columna, form_type pasaba a ser la línea entera, y el filtro
+    `!= "8-K"` descartaba todas las filas.
+
+    El síntoma en producción no fue un error sino algo peor: HTTP 200, cero
+    excepciones, '0 formularios 8-K encontrados' todos los días y el pipeline
+    completo en verde sobre una base de datos vacía. El fixture original se
+    había escrito con el formato segmentado, así que los tests confirmaban la
+    suposición equivocada en lugar de contrastarla.
+    """
+    raw = (FIXTURES / "sample_daily_index_continuous_sep.idx").read_text()
+    rows = parse_daily_index(raw)
+
+    assert {r["form_type"] for r in rows} == {"8-K"}
+    assert len(rows) == 3  # ACME, BETA, EPSILON — no el 8-K/A ni el 10-K
+    acme = next(r for r in rows if "ACME" in r["company_name"])
+    assert acme["cik"] == "1234567"
+    assert acme["date_filed"] == "2026-08-14"
+    assert acme["file_name"] == "edgar/data/1234567/0001234567-26-000123.txt"
+
+
+def test_parse_daily_index_da_el_mismo_resultado_con_ambos_separadores():
+    """El invariante que importa: el MISMO contenido parseado igual, se dibuje
+    la línea separadora en tramos por columna o como una tira continua.
+
+    Se genera la variante continua a partir del fixture segmentado en vez de
+    comparar dos ficheros distintos — así el test comprueba el efecto del
+    separador y nada más."""
+    segmentado = (FIXTURES / "sample_daily_index.idx").read_text()
+    lineas = segmentado.splitlines()
+    idx_sep = next(i for i, l in enumerate(lineas) if set(l.strip()) <= {"-", " "} and "-" in l)
+    lineas[idx_sep] = "-" * len(lineas[idx_sep])
+    continuo = "\n".join(lineas)
+
+    assert parse_daily_index(segmentado) == parse_daily_index(continuo)
+
+
+def test_parse_daily_index_falla_ruidosamente_si_no_reconoce_ninguna_fila():
+    """Cero filas reconocibles tiene que ROMPER, no devolver []. Un
+    daily-index de un día hábil siempre trae filings; devolver vacío en
+    silencio fue lo que permitió que el pipeline corriera semanas en verde
+    sin ingestar nada."""
+    basura = "Description: algo\nOtra cabecera\n\ntexto que no es una tabla\n"
+    with pytest.raises(ValueError, match="Formato de daily-index inesperado"):
+        parse_daily_index(basura)
+
+
+def test_parse_daily_index_no_confunde_nombres_con_espacios():
+    """Los nombres de empresa llevan espacios simples; el corte entre columnas
+    son 2+ espacios. 'EPSILON ENERGY PARTNERS LP' debe salir entero."""
+    raw = (FIXTURES / "sample_daily_index_continuous_sep.idx").read_text()
+    rows = parse_daily_index(raw)
+    epsilon = next(r for r in rows if r["cik"] == "3334445")
+    assert epsilon["company_name"] == "EPSILON ENERGY PARTNERS LP"
+
+
 def test_item_extraction_numeric_format():
     """Cabecera con el Item impreso como número ('2.02')."""
     text = (FIXTURES / "sample_8k_header_numeric.txt").read_text()

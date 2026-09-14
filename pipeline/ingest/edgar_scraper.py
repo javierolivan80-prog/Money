@@ -79,62 +79,72 @@ def daily_index_url(day: date) -> str:
     )
 
 
+# Una fila de datos del daily-index, reconocida por su ESTRUCTURA y no por la
+# posición de sus columnas: tipo de formulario, nombre de empresa, CIK
+# (dígitos), fecha ISO y ruta del fichero, separados por 2+ espacios.
+#
+# POR QUÉ ASÍ Y NO POR POSICIONES (bug real, encontrado en producción el
+# 2026-09-14): la versión anterior derivaba el corte de cada columna de la
+# línea de guiones, asumiendo que EDGAR la publica en tramos por columna
+# ("---- ---- ----"). Cuando el separador es en cambio una TIRA CONTINUA de
+# guiones, esa lógica colapsa a una sola columna, form_type pasa a ser la línea
+# entera, y la comparación `form_type != "8-K"` descarta TODAS las filas. El
+# resultado era 0 eventos cada día, con HTTP 200 y sin una sola excepción: el
+# pipeline entero corría en verde sobre una base de datos vacía.
+#
+# El fixture de los tests se había escrito con el formato segmentado (nunca se
+# pudo descargar el fichero real desde el sandbox, egress bloqueado), así que
+# los tests confirmaban la suposición equivocada en vez de contrastarla.
+# Anclarse en el CIK y la fecha ISO hace el parseo independiente de anchos y
+# de la forma del separador.
+_ROW_RE = re.compile(
+    r"^(?P<form_type>\S.*?)\s{2,}"        # tipo de formulario
+    r"(?P<company_name>\S.*?)\s{2,}"      # nombre (puede contener espacios simples)
+    r"(?P<cik>\d{1,10})\s+"               # CIK
+    r"(?P<date_filed>\d{4}-\d{2}-\d{2})\s+"  # fecha de presentación
+    r"(?P<file_name>\S+)\s*$"             # ruta del documento
+)
+
+
 def parse_daily_index(raw_text: str) -> list[dict]:
-    """Parsea el .idx de ancho fijo de EDGAR.
+    """Parsea el .idx diario de EDGAR y devuelve solo los 8-K.
 
-    Formato (tras la cabecera y una línea de guiones separadora):
-      Form Type   Company Name   CIK   Date Filed   File Name
-    Columnas de ancho fijo, no separadas por un delimitador único — hay que
-    usar las posiciones de la línea de guiones para saber dónde corta cada campo.
-    Filtra solo form_type == '8-K' (exacto, para no capturar 8-K/A como si fuera
-    igual — las enmiendas se tratan aparte, no en el POC).
+    Independiente del ancho de columna y de la forma de la línea separadora
+    (ver _ROW_RE). Filtra form_type == '8-K' exacto, para no capturar 8-K/A:
+    las enmiendas se tratan aparte, no en el POC.
+
+    Lanza si NINGUNA línea del fichero tiene forma de fila de datos. Un
+    daily-index de un día hábil siempre trae filings de algún tipo; cero
+    filas reconocibles significa que el formato cambió o que la descarga no es
+    lo que se espera, y eso tiene que romper el pipeline en vez de dejarlo
+    correr en verde sobre una base vacía — que es exactamente lo que pasó
+    cuando esto devolvía [] en silencio.
     """
-    lines = raw_text.splitlines()
-    # La línea separadora real de EDGAR es de la forma "---- ---- ----" (grupos
-    # de guiones por columna, separados por espacios) — no una tira de guiones
-    # continua. set(l.strip()) == {"-"} fallaba contra el formato real por eso.
-    def is_separator(line: str) -> bool:
-        stripped = line.strip()
-        return bool(stripped) and set(stripped) <= {"-", " "} and "-" in stripped
-
-    sep_idx = next((i for i, l in enumerate(lines) if is_separator(l)), None)
-    if sep_idx is None:
-        raise ValueError("Formato de daily-index inesperado: no se encontró la línea separadora")
-
-    header = lines[sep_idx - 1]
-    sep_line = lines[sep_idx]
-    # Cada columna empieza donde EMPIEZA su tramo de guiones (no donde termina):
-    # los tramos de guiones están separados por espacios, y cortar en el inicio
-    # de cada tramo deja el espacio de separación como parte del campo previo,
-    # que igualmente se descarta con .strip() en cut().
-    col_starts = [
-        i for i in range(len(sep_line)) if sep_line[i] == "-" and (i == 0 or sep_line[i - 1] != "-")
-    ]
-
-    def cut(line: str, i: int) -> str:
-        # La última columna (File Name) es de longitud variable y más larga que
-        # su cabecera de dashes — corta hasta el final real de la línea de datos,
-        # no hasta una posición fija derivada de la cabecera.
-        end = col_starts[i + 1] if i + 1 < len(col_starts) else len(line)
-        return line[col_starts[i] : end].strip()
-
-    rows = []
-    for line in lines[sep_idx + 1 :]:
-        if not line.strip():
+    all_rows, eight_k = 0, []
+    for line in raw_text.splitlines():
+        match = _ROW_RE.match(line)
+        if match is None:
             continue
-        form_type = cut(line, 0)
-        if form_type != "8-K":
+        all_rows += 1
+        if match.group("form_type") != "8-K":
             continue
-        rows.append(
+        eight_k.append(
             {
-                "form_type": form_type,
-                "company_name": cut(line, 1),
-                "cik": cut(line, 2).lstrip("0") or "0",
-                "date_filed": cut(line, 3),
-                "file_name": cut(line, 4),
+                "form_type": match.group("form_type"),
+                "company_name": match.group("company_name").strip(),
+                "cik": match.group("cik").lstrip("0") or "0",
+                "date_filed": match.group("date_filed"),
+                "file_name": match.group("file_name"),
             }
         )
-    return rows
+
+    if all_rows == 0:
+        raise ValueError(
+            "Formato de daily-index inesperado: ninguna línea tiene forma de fila de datos "
+            "(tipo, empresa, CIK, fecha, fichero). ¿Cambió el formato de EDGAR?"
+        )
+
+    return eight_k
 
 
 # Títulos oficiales de Item de la Form 8-K (definidos por la propia SEC, estables
