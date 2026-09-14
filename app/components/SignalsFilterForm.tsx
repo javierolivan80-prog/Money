@@ -28,7 +28,7 @@ export function SignalsFilterForm({ eventClasses }: { eventClasses: string[] }) 
     if (dateFrom) params.set("dateFrom", dateFrom);
     if (dateTo) params.set("dateTo", dateTo);
     if (minConfidence) params.set("minConfidence", minConfidence);
-    router.push(`/signals?${params.toString()}`);
+    router.push(`/senales?${params.toString()}`);
   }
 
   function clear() {
@@ -38,7 +38,7 @@ export function SignalsFilterForm({ eventClasses }: { eventClasses: string[] }) 
     setDateFrom("");
     setDateTo("");
     setMinConfidence("");
-    router.push("/signals");
+    router.push("/senales");
   }
 
   const inputClass = "border border-neutral-300 dark:border-neutral-700 bg-transparent rounded px-2 py-1 text-sm";

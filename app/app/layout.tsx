@@ -6,8 +6,8 @@ import "./globals.css";
 // que el resto del proyecto — ver ARCHITECTURE_LEAN.md). Fuente del sistema.
 
 export const metadata: Metadata = {
-  title: "Money POC — Dashboard",
-  description: "Dashboard de solo lectura del backtest de eventos EDGAR/FDA",
+  title: "Money — Panel",
+  description: "Panel de solo lectura: eventos detectados, análisis y resultados simulados",
 };
 
 export default function RootLayout({

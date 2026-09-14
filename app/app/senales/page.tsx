@@ -6,12 +6,12 @@ import { SignalsTable } from "@/components/SignalsTable";
 
 export const dynamic = "force-dynamic";
 
-export default async function SignalsPage({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
+export default async function SenalesPage({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
   if (!isDatabaseConfigured()) {
     return (
       <main className="max-w-3xl mx-auto p-8">
-        <Nav active="/signals" />
-        <h1 className="text-2xl font-bold mb-4">All Signals</h1>
+        <Nav active="/senales" />
+        <h1 className="text-2xl font-bold mb-4">Señales</h1>
         <p className="text-sm text-neutral-500">DATABASE_URL no está configurada.</p>
       </main>
     );
@@ -33,12 +33,12 @@ export default async function SignalsPage({ searchParams }: { searchParams: Prom
 
   return (
     <main className="max-w-7xl mx-auto p-6">
-      <Nav active="/signals" />
+      <Nav active="/senales" />
       <header className="mb-6">
-        <h1 className="text-2xl font-bold">All Signals</h1>
+        <h1 className="text-2xl font-bold">Señales</h1>
         <p className="text-sm text-neutral-500 mt-1">
-          Feed cronológico de todos los eventos analizados (con o sin trade_decision) — máx. 500 más recientes que
-          cumplan los filtros.
+          Cada evento analizado, más reciente primero — abre una fila (▸) para ver el razonamiento completo: quién opina qué, cuántos
+          casos parecidos hubo antes, y por qué se opera o no. Máx. 500.
         </p>
       </header>
 
