@@ -460,6 +460,67 @@ CREATE TABLE IF NOT EXISTS paper_trading_reports (
 );
 
 -- ============================================================================
+-- fundamentals: cuentas anuales reales desde XBRL de la SEC
+-- (pipeline/ingest/xbrl_fundamentals.py). Insumo del análisis de largo plazo
+-- (calidad del negocio + valoración), que hasta ahora no existía: el proyecto
+-- solo tenía eventos y precios.
+--
+-- filed_at es la piedra angular anti-look-ahead de esta tabla, igual que
+-- d0_close_date lo es para events: el ejercicio cerrado el 31-12 no se
+-- conoce hasta que se presenta el 10-K semanas después. TODA lectura desde
+-- el camino de decisión debe acotarse por filed_at, NUNCA por
+-- fiscal_period_end (ver la cabecera de xbrl_fundamentals.py).
+--
+-- Columnas NULL cuando la empresa no reporta esa magnitud bajo ninguna
+-- etiqueta us-gaap conocida — nunca imputadas.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS fundamentals (
+    cik                  TEXT NOT NULL REFERENCES universe(cik),
+    fiscal_period_end    DATE NOT NULL,   -- período que cubre el dato
+    filed_at             DATE NOT NULL,   -- cuándo se hizo PÚBLICO (anti-look-ahead)
+    form                 TEXT NOT NULL,   -- '10-K'
+    revenue              NUMERIC,
+    net_income           NUMERIC,
+    stockholders_equity  NUMERIC,
+    total_assets         NUMERIC,
+    total_liabilities    NUMERIC,
+    long_term_debt       NUMERIC,
+    operating_cash_flow  NUMERIC,
+    capex                NUMERIC,
+    shares_outstanding   NUMERIC,
+    fetched_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cik, fiscal_period_end, form),
+    -- Un ejercicio no puede presentarse antes de cerrar. Si esto salta, el
+    -- parseo está confundiendo las dos fechas — que es justo el bug que esta
+    -- tabla está diseñada para hacer imposible.
+    CONSTRAINT chk_fundamentals_filed_after_period CHECK (filed_at >= fiscal_period_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fundamentals_cik_filed ON fundamentals (cik, filed_at);
+
+-- quality_scores: salida de analyze/quality_score.py — una nota por empresa
+-- y fecha de cálculo, con el desglose por criterio en JSONB para que el
+-- dashboard lo renderice sin reimplementar ninguna fórmula en TypeScript
+-- (mismo principio que portfolio_reports / validation_reports).
+--
+-- as_of_date es la fecha con la que se acotó filed_at al calcular: deja
+-- explícito en la propia fila QUÉ se sabía cuando se calculó esa nota, en vez
+-- de depender de cuándo se corrió el proceso.
+CREATE TABLE IF NOT EXISTS quality_scores (
+    cik           TEXT NOT NULL REFERENCES universe(cik),
+    as_of_date    DATE NOT NULL,
+    total_score   NUMERIC,           -- NULL si no había ni un criterio calculable
+    verdict       TEXT NOT NULL,
+    components    JSONB NOT NULL,    -- desglose por criterio, con explicación en texto
+    n_years       INT NOT NULL,
+    price_used    NUMERIC,           -- precio con el que se valoró (NULL = sin componente de precio)
+    computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cik, as_of_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_scores_as_of ON quality_scores (as_of_date, total_score DESC);
+
+-- ============================================================================
 -- validation_reports: Fase 6 (pipeline/validation/report.py) — event study,
 -- sensibilidad y veredicto GREENLIGHT/YELLOWLIGHT/REDLIGHT, persistidos en
 -- Postgres en vez de solo como docs/VALIDATION_REPORT.md.

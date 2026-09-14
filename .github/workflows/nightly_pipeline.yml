@@ -103,6 +103,23 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.ingest.fama_french
 
+      - name: Ingesta de cuentas anuales (XBRL de la SEC — análisis de largo plazo)
+        # Insumo del análisis fundamental: los mismos números que venden los
+        # proveedores de pago, publicados gratis por la SEC en XBRL. Un fallo
+        # por empresa no aborta el resto (ver ingest_universe_fundamentals).
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+        run: python -m pipeline.ingest.xbrl_fundamentals
+
+      - name: Notas de calidad de negocio (análisis fundamental)
+        # Va DESPUÉS de la ingesta de cuentas y del backfill de precios:
+        # necesita ambas (las cuentas para los 4 criterios de negocio, el
+        # precio para el de valoración).
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.analyze.quality_score
+
       - name: Calcular CAR de eventos pendientes (insumo de historical_analogues.py)
         # Sin este paso, analyze/historical_analogues.py siempre vería
         # n_analogues=0 — car_results no se llena solo (ver su docstring).

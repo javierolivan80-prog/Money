@@ -19,6 +19,7 @@ import Link from "next/link";
 const TABS = [
   { href: "/", label: "Inicio" },
   { href: "/senales", label: "Señales" },
+  { href: "/largo-plazo", label: "Largo plazo" },
   { href: "/cartera", label: "Cartera" },
   { href: "/funciona", label: "¿Funciona?" },
   { href: "/como-funciona", label: "Cómo funciona" },

@@ -353,6 +353,69 @@ export async function getValidationReport(runBatchTag: string): Promise<Validati
 }
 
 // ============================================================================
+// Largo plazo — análisis fundamental (pipeline/analyze/quality_score.py sobre
+// pipeline/ingest/xbrl_fundamentals.py). Pregunta distinta a la del resto del
+// dashboard: no "¿esta noticia mueve el precio?" sino "¿es este un buen
+// negocio a un precio razonable?", sobre las cuentas anuales auditadas.
+// ============================================================================
+
+export interface QualityComponent {
+  name: string;
+  score: number | null;      // null = no calculable con los datos disponibles
+  raw_value: number | null;
+  explanation: string;       // texto ya redactado en Python — no se reformula aquí
+}
+
+export interface QualityScoreRow {
+  cik: string;
+  ticker: string;
+  company_name: string | null;
+  as_of_date: string;
+  total_score: number | null;
+  verdict: string;
+  components: QualityComponent[];
+  n_years: number;
+  price_used: number | null;
+}
+
+/** La fecha de cálculo más reciente con notas guardadas. */
+export async function getLatestQualityScoreDate(): Promise<string | null> {
+  const pool = getPool();
+  const { rows } = await pool.query(`SELECT max(as_of_date) AS d FROM quality_scores`);
+  const d = rows[0]?.d;
+  if (!d) return null;
+  return d instanceof Date ? d.toISOString().slice(0, 10) : String(d);
+}
+
+/** Notas de esa fecha, de mejor a peor. Las empresas sin nota calculable
+ * (total_score NULL) van al final: no son "malas", es que no hay datos. */
+export async function getQualityScores(asOfDate: string): Promise<QualityScoreRow[]> {
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `
+    SELECT qs.cik, u.ticker, u.company_name, qs.as_of_date, qs.total_score,
+           qs.verdict, qs.components, qs.n_years, qs.price_used
+    FROM quality_scores qs
+    JOIN universe u ON u.cik = qs.cik
+    WHERE qs.as_of_date = $1
+    ORDER BY qs.total_score DESC NULLS LAST, u.ticker
+    `,
+    [asOfDate]
+  );
+  return rows.map((r) => ({
+    cik: r.cik,
+    ticker: r.ticker,
+    company_name: r.company_name,
+    as_of_date: r.as_of_date instanceof Date ? r.as_of_date.toISOString().slice(0, 10) : r.as_of_date,
+    total_score: r.total_score !== null ? parseFloat(r.total_score) : null,
+    verdict: r.verdict,
+    components: r.components,
+    n_years: r.n_years,
+    price_used: r.price_used !== null ? parseFloat(r.price_used) : null,
+  }));
+}
+
+// ============================================================================
 // Tab 1 "All Signals" (Fase 5) — feed cronológico de eventos analizados,
 // con o sin trade_decision, con filtros. A diferencia del resto de este
 // archivo, esta query SÍ compone datos con SQL propio (no lee un

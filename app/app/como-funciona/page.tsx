@@ -104,6 +104,20 @@ export default function ComoFuncionaPage() {
       </section>
 
       <section className="mt-8 border-t border-neutral-200 dark:border-neutral-800 pt-6">
+        <p className="font-semibold mb-2">Aparte: el análisis de largo plazo</p>
+        <p className="text-sm text-neutral-600 dark:text-neutral-400 mb-2">
+          Todo lo de arriba va de <strong>eventos</strong> y horizonte de días. La pestaña <strong>Largo plazo</strong> responde una
+          pregunta completamente distinta: <em>¿es este un buen negocio a un precio razonable?</em>, con horizonte de años.
+        </p>
+        <p className="text-sm text-neutral-600 dark:text-neutral-400">
+          No mira noticias ni gráficos: descarga las <strong>cuentas anuales auditadas</strong> que cada empresa presenta ante la SEC
+          (gratis, en formato XBRL) y puntúa cinco cosas: cuánto gana sobre su capital, cuánta deuda arrastra, si el beneficio se
+          convierte en caja real, si crece, y si la acción está cara. Es el tipo de análisis que se hace para comprar un negocio, no
+          para especular con una noticia.
+        </p>
+      </section>
+
+      <section className="mt-8 border-t border-neutral-200 dark:border-neutral-800 pt-6">
         <p className="font-semibold mb-2">Reglas que el sistema nunca rompe</p>
         <ul className="text-sm text-neutral-600 dark:text-neutral-400 list-disc list-inside space-y-1">
           <li>Nunca usa información que no existía en el momento de la decisión (nada de "trampa" mirando al futuro).</li>
