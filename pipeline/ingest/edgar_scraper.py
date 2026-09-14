@@ -139,9 +139,17 @@ def parse_daily_index(raw_text: str) -> list[dict]:
         )
 
     if all_rows == 0:
+        # Volcado del principio del fichero EN EL PROPIO ERROR. Sin esto,
+        # arreglar el parser es adivinar: desde el entorno de desarrollo no hay
+        # salida de red hacia sec.gov (AUDIT_LEAN.md §1.5), así que la ÚNICA
+        # forma de ver cómo es el fichero de verdad es que el runner que sí
+        # puede descargarlo lo imprima cuando falla. Es la lección del bug
+        # anterior: dos parsers seguidos escritos contra un formato supuesto.
+        preview = "\n".join(f"    | {line[:200]}" for line in raw_text.splitlines()[:15])
         raise ValueError(
             "Formato de daily-index inesperado: ninguna línea tiene forma de fila de datos "
-            "(tipo, empresa, CIK, fecha, fichero). ¿Cambió el formato de EDGAR?"
+            "(tipo, empresa, CIK, fecha, fichero). ¿Cambió el formato de EDGAR?\n"
+            f"Primeras líneas de lo que devolvió el servidor ({len(raw_text)} caracteres):\n{preview}"
         )
 
     return eight_k
