@@ -238,13 +238,31 @@ def scrape_day(day: date) -> list[RawFiling]:
     logger.info("%d formularios 8-K encontrados el %s", len(rows), day.isoformat())
 
     filings = []
+    # Contadores de descarte. Sin esto, un 8-K que se descarga y luego se tira
+    # es invisible: el log solo decía cuántos se ENCONTRARON, no cuántos
+    # sobrevivían hasta la base de datos. Con el parser del índice arreglado
+    # aparecieron cientos de filings al día y aun así no llegaba ninguno —
+    # imposible de localizar sin saber en cuál de los dos filtros caían.
+    sin_items, sin_clase = 0, 0
     for row in rows:
         try:
             accession, item_codes = fetch_filing_item_codes(row["file_name"])
         except RuntimeError as exc:
             logger.error("Saltando %s: %s", row["file_name"], exc)
             continue
+        if not item_codes:
+            sin_items += 1
+            if sin_items <= 3:
+                # Volcado de diagnóstico de los primeros casos: si la cabecera
+                # SGML no trae 'ITEM INFORMATION:' con el formato esperado, el
+                # pipeline entero se queda sin eventos y hay que VER el formato
+                # real para arreglarlo (ver ADVERTENCIA en
+                # fetch_filing_item_codes: nunca se pudo validar contra un
+                # filing de verdad desde el sandbox).
+                logger.warning("Sin Items extraídos de %s — revisar formato de cabecera", row["file_name"])
+            continue
         if not classify_event_classes(item_codes):
+            sin_clase += 1
             continue  # ninguna clase relevante, se descarta (no es data loss: es scope)
         raw_hash = hashlib.sha256(f"{accession}:{sorted(item_codes)}".encode()).hexdigest()
         filed_at = datetime.strptime(row["date_filed"], "%Y-%m-%d")
@@ -259,6 +277,20 @@ def scrape_day(day: date) -> list[RawFiling]:
                 source_url=f"{config.EDGAR_BASE}/{row['file_name']}",
                 raw_text_hash=raw_hash,
             )
+        )
+
+    if rows and not filings:
+        # Todos los 8-K del día descargados y ninguno sobrevive: eso no es
+        # "scope", es un parser roto. Que se vea en el log como lo que es.
+        logger.warning(
+            "%s: %d formularios 8-K descargados y NINGUNO utilizable "
+            "(%d sin Items extraídos, %d sin clase de evento relevante)",
+            day.isoformat(), len(rows), sin_items, sin_clase,
+        )
+    else:
+        logger.info(
+            "%s: %d de %d formularios utilizables (%d sin Items, %d sin clase relevante)",
+            day.isoformat(), len(filings), len(rows), sin_items, sin_clase,
         )
     return filings
 
