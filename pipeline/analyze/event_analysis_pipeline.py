@@ -76,19 +76,29 @@ def fetch_events_needing_analysis(conn, limit: int = CHUNK_SIZE) -> list[dict]:
 def check_fda_crl_without_8k(conn, cik: str, event_class: str, d0_close_date: date) -> bool:
     """Regla 6 de abstention_engine: una CRL de FDA sin 8-K correspondiente
     todavía no está comunicada oficialmente por la empresa. Solo aplica a
-    eventos FDA_CRL — cualquier otra clase devuelve False sin consultar la BD."""
+    eventos FDA_CRL — cualquier otra clase devuelve False sin consultar la BD.
+
+    La ventana mira hacia ATRÁS y hasta D0 inclusive, nunca más allá. Antes se
+    extendía FDA_CRL_8K_WINDOW_DAYS también hacia delante, lo que respondía a
+    una pregunta distinta de la que plantea la regla: "¿acabará la empresa
+    comunicando esto?" en vez de "¿lo ha comunicado ya?". Con la ventana
+    futura, el sistema dejaba de abstenerse justo en los casos en que un 8-K
+    posterior confirmaba el evento — es decir, usaba el futuro para decidir
+    operar en el presente. Acotarla a D0 devuelve la regla a su intención y es
+    además el lado conservador: ante la duda, abstenerse.
+    """
     if event_class != "FDA_CRL":
         return False
     window_start = d0_close_date - timedelta(days=FDA_CRL_8K_WINDOW_DAYS)
-    window_end = d0_close_date + timedelta(days=FDA_CRL_8K_WINDOW_DAYS)
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1 FROM events
-            WHERE cik = %(cik)s AND source = 'EDGAR' AND d0_close_date BETWEEN %(start)s AND %(end)s
+            WHERE cik = %(cik)s AND source = 'EDGAR'
+              AND d0_close_date BETWEEN %(start)s AND %(as_of)s
             LIMIT 1
             """,
-            {"cik": cik, "start": window_start, "end": window_end},
+            {"cik": cik, "start": window_start, "as_of": d0_close_date},
         )
         return cur.fetchone() is None
 

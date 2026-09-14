@@ -127,7 +127,7 @@ class TestAgainstRealPostgres:
         yield
         self.conn.close()
 
-    def _insert_event(self, cik: str, d0: date, event_class: str = "8K_2.02_EARNINGS") -> int:
+    def _insert_event(self, cik: str, d0: date, event_class: str = "8K_2.02_EARNINGS", car: float = 0.05) -> int:
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO universe (cik, ticker, company_name, first_seen_date, last_seen_date) "
@@ -147,8 +147,8 @@ class TestAgainstRealPostgres:
             event_id = cur.fetchone()["event_id"]
             cur.execute(
                 "INSERT INTO car_results (event_id, window_days, car, abnormal_volume_ratio, n_estimation_days) "
-                "VALUES (%s, 20, 0.05, 1.5, 200)",
-                (event_id,),
+                "VALUES (%s, 20, %s, 1.5, 200)",
+                (event_id, car),
             )
         self.conn.commit()
         return event_id
@@ -197,3 +197,47 @@ class TestAgainstRealPostgres:
         )
         assert result.n_analogues == 10
         assert result.confidence > 0
+
+    def test_class_prior_excludes_events_on_or_after_as_of_date(self):
+        """Regresión: el prior de shrinkage se calculaba sobre la clase ENTERA,
+        futuro incluido. Es look-ahead, y pesa más cuanto menos análogos previos
+        hay — justo en las observaciones más frágiles del backtest."""
+        from pipeline.analyze.historical_analogues import get_class_prior_mean
+
+        # Pasado tranquilo (+1%) y futuro extremo (+50%). Si el futuro se cuela,
+        # la media se dispara muy por encima del 1%.
+        self._insert_event("200", date(2022, 3, 1), car=0.01)
+        self._insert_event("201", date(2022, 3, 2), car=0.01)
+        self._insert_event("202", date(2024, 9, 1), car=0.50)
+        self._insert_event("203", date(2024, 9, 2), car=0.50)
+
+        prior = get_class_prior_mean(self.conn, "8K_2.02_EARNINGS", 20, as_of_date=date(2023, 1, 1))
+        assert prior == pytest.approx(1.0, abs=0.01), f"prior contaminado por eventos futuros: {prior}"
+
+    def test_class_prior_is_zero_when_no_prior_events_exist(self):
+        """Sin nada anterior a as_of_date se contrae hacia 'sin efecto' (0.0),
+        no hacia la media del futuro ni hacia None."""
+        from pipeline.analyze.historical_analogues import get_class_prior_mean
+
+        self._insert_event("300", date(2025, 1, 1), car=0.42)
+
+        prior = get_class_prior_mean(self.conn, "8K_2.02_EARNINGS", 20, as_of_date=date(2021, 1, 1))
+        assert prior == 0.0
+
+    def test_estimate_impact_is_not_contaminated_by_future_events(self):
+        """El mismo look-ahead, visto de extremo a extremo: con pocos análogos
+        previos el shrinkage da casi todo el peso al prior, así que un prior
+        contaminado arrastra la magnitud esperada — y con ella el EV."""
+        from pipeline.analyze.historical_analogues import estimate_impact_for_event
+
+        self._insert_event("400", date(2022, 6, 1), car=0.01)
+        self._insert_event("401", date(2022, 6, 2), car=0.01)
+        for i in range(20):
+            self._insert_event(str(500 + i), date(2024, 6, 1), car=0.50)
+
+        result = estimate_impact_for_event(
+            self.conn, "8K_2.02_EARNINGS", as_of_date=date(2023, 1, 1), exclude_event_id=999999, window_days=20
+        )
+        assert result.n_analogues == 2
+        # 2 análogos al +1% con prior +1% => magnitud ~1%, lejos del +50% futuro.
+        assert result.expected_magnitude_pct == pytest.approx(1.0, abs=0.2)

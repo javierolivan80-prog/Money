@@ -141,12 +141,25 @@ def test_fda_crl_without_8k_true_when_no_matching_8k_nearby(conn):
     assert check_fda_crl_without_8k(conn, "1", "FDA_CRL", date(2024, 1, 1)) is True
 
 
-def test_fda_crl_without_8k_false_when_8k_exists_within_window(conn):
+def test_fda_crl_without_8k_false_when_8k_already_filed_before_d0(conn):
+    """Un 8-K anterior a D0 sí está disponible al decidir: la empresa ya lo ha
+    comunicado, así que la regla 6 no veta."""
+    from pipeline.analyze.event_analysis_pipeline import check_fda_crl_without_8k
+
+    _seed_event(conn, "1", "BIOX", date(2024, 1, 10), event_class="FDA_CRL")
+    _seed_event(conn, "1", "BIOX", date(2024, 1, 8), event_class="8K_8.01_OTHER")  # comunicado 2 días antes
+    assert check_fda_crl_without_8k(conn, "1", "FDA_CRL", date(2024, 1, 10)) is False
+
+
+def test_fda_crl_without_8k_ignores_8k_filed_after_d0(conn):
+    """Regresión anti-look-ahead: un 8-K posterior a D0 no existe todavía en el
+    momento de la decisión. Antes se buscaba en una ventana de ±10 días, así
+    que este caso devolvía False (operar) usando información del futuro."""
     from pipeline.analyze.event_analysis_pipeline import check_fda_crl_without_8k
 
     _seed_event(conn, "1", "BIOX", date(2024, 1, 1), event_class="FDA_CRL")
-    _seed_event(conn, "1", "BIOX", date(2024, 1, 3), event_class="8K_8.01_OTHER")  # el 8-K comunicando la CRL
-    assert check_fda_crl_without_8k(conn, "1", "FDA_CRL", date(2024, 1, 1)) is False
+    _seed_event(conn, "1", "BIOX", date(2024, 1, 3), event_class="8K_8.01_OTHER")  # aún no ocurrido en D0
+    assert check_fda_crl_without_8k(conn, "1", "FDA_CRL", date(2024, 1, 1)) is True
 
 
 # ---------------------------------------------------------------------------

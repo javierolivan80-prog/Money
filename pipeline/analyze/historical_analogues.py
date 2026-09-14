@@ -25,9 +25,9 @@ from datetime import date
 logger = logging.getLogger(__name__)
 
 # Umbral de shrinkage: por debajo de este nº de análogos, la estimación se
-# empuja hacia el prior (media de TODOS los análogos de la clase, sin
-# restricción temporal, como aproximación de la media poblacional de largo
-# plazo) con un peso creciente cuanto menor sea n. n/(n+K) es el estimador de
+# empuja hacia el prior (media de los análogos de la clase ANTERIORES a la
+# fecha de decisión, como aproximación de la media poblacional de largo plazo
+# conocible en ese momento) con un peso creciente cuanto menor sea n. n/(n+K) es el estimador de
 # James-Stein/empírico-Bayes más simple que existe — deliberadamente simple,
 # no un modelo jerárquico completo (mismo principio de parsimonia que en
 # ev_engine.py).
@@ -67,7 +67,8 @@ def compute_impact_estimate(
 
     analogue_cars_pct: CAR en % (no fracción) de cada análogo, YA restringido
         por el caller a eventos anteriores a as_of_date de la misma clase.
-    class_prior_mean_car_pct: media de la clase SIN restricción temporal — el
+    class_prior_mean_car_pct: media de la clase, calculada por el caller SOLO
+        sobre eventos anteriores a as_of_date (ver get_class_prior_mean) — el
         prior hacia el que se contrae la estimación cuando n es bajo. Pasar 0.0
         si no se tiene (equivale a contraer hacia "sin efecto", la opción más
         conservadora posible).
@@ -151,19 +152,34 @@ def get_historical_analogues(conn, event_class: str, as_of_date: date, exclude_e
         return cur.fetchall()
 
 
-def get_class_prior_mean(conn, event_class: str, window_days: int) -> float:
-    """Media de CAR (%) de TODA la clase, sin restricción temporal — el prior
-    hacia el que se contrae la estimación cuando hay pocos análogos previos
-    a una fecha dada (ver SHRINKAGE_K)."""
+def get_class_prior_mean(conn, event_class: str, window_days: int, as_of_date: date) -> float:
+    """Media de CAR (%) de la clase usando SOLO eventos anteriores a as_of_date
+    — el prior hacia el que se contrae la estimación cuando hay pocos análogos
+    (ver SHRINKAGE_K).
+
+    El filtro por as_of_date no es opcional ni cosmético: el prior pesa
+    (1 - shrinkage_weight), es decir, pesa MÁS cuanto MENOS análogos previos
+    hay. Sin el filtro, los eventos más tempranos del backtest —justo los que
+    dependen casi por completo del prior— recibían una media calculada sobre
+    los 5 años enteros, futuro incluido. Eso es look-ahead, y del tipo peor:
+    invisible en los precios, concentrado en las observaciones más frágiles, y
+    sesgando el EV en la dirección que el propio periodo acabó teniendo.
+
+    Devuelve 0.0 cuando no hay ningún evento previo (contraer hacia "sin
+    efecto" es la opción conservadora, y es lo que ya documentaba
+    compute_impact_estimate para ese caso).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT avg(car) * 100 AS mean_car_pct
             FROM car_results cr
             JOIN events e ON e.event_id = cr.event_id
-            WHERE e.event_class = %(event_class)s AND cr.window_days = %(window_days)s
+            WHERE e.event_class = %(event_class)s
+              AND cr.window_days = %(window_days)s
+              AND e.d0_close_date < %(as_of_date)s
             """,
-            {"event_class": event_class, "window_days": window_days},
+            {"event_class": event_class, "window_days": window_days, "as_of_date": as_of_date},
         )
         row = cur.fetchone()
         mean = row["mean_car_pct"] if row else None
@@ -172,7 +188,7 @@ def get_class_prior_mean(conn, event_class: str, window_days: int) -> float:
 
 def estimate_impact_for_event(conn, event_class: str, as_of_date: date, exclude_event_id: int, window_days: int = 20) -> ImpactEstimate:
     analogues = get_historical_analogues(conn, event_class, as_of_date, exclude_event_id, window_days)
-    prior = get_class_prior_mean(conn, event_class, window_days)
+    prior = get_class_prior_mean(conn, event_class, window_days, as_of_date)
     cars_pct = [float(a["car"]) * 100 for a in analogues]
     volume_ratios = [float(a["abnormal_volume_ratio"]) for a in analogues if a["abnormal_volume_ratio"] is not None]
     return compute_impact_estimate(cars_pct, volume_ratios, class_prior_mean_car_pct=prior)
