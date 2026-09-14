@@ -162,6 +162,31 @@ def test_persist_validation_report_reuses_existing_portfolio_report(conn):
     assert "sensitivity" in row["report_json"]
 
 
+def test_json_safe_replaces_non_finite_floats():
+    from pipeline.validation.report import _json_safe
+
+    payload = {
+        "a": float("inf"),
+        "b": float("-inf"),
+        "c": float("nan"),
+        "d": 1.5,
+        "nested": {"x": float("inf"), "y": [1.0, float("nan"), 3]},
+        "s": "unchanged",
+    }
+    safe = _json_safe(payload)
+    assert safe["a"] is None
+    assert safe["b"] is None
+    assert safe["c"] is None
+    assert safe["d"] == 1.5
+    assert safe["nested"]["x"] is None
+    assert safe["nested"]["y"] == [1.0, None, 3]
+    assert safe["s"] == "unchanged"
+
+    import json
+
+    json.dumps(safe)  # no debe lanzar — es justo lo que rompía el INSERT real
+
+
 def test_persist_validation_report_upsert_overwrites(conn):
     """ON CONFLICT DO UPDATE: reejecutar el paso nocturno con el mismo tag
     (ej. un re-disparo manual del workflow) actualiza la fila en vez de

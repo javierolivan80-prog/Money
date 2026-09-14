@@ -1,6 +1,7 @@
 """test_event_study.py — Fase 6 PARTE 1. compute_mde y
 compute_event_study_for_class son puros (cálculo a mano); run_event_study
 necesita Postgres real (lee car_results)."""
+import math
 import os
 
 import numpy as np
@@ -81,6 +82,26 @@ def test_event_study_large_consistent_effect_is_significant():
     result = compute_event_study_for_class(car_values)
     assert result["significant"] is True
     assert "Significativo" in result["conclusion"]
+
+
+def test_event_study_zero_variance_does_not_produce_infinity():
+    """Regresión: con varianza cero (todos los CAR idénticos), t=media/(0/√n)
+    es una división por cero — scipy devolvía Infinity, que rompía el INSERT
+    a validation_reports (Postgres rechaza JSON con el token "Infinity",
+    encontrado así con el pipeline nocturno real). Debe reportarse como no
+    computable (None), nunca como un float infinito/NaN."""
+    car_values = [0.03, 0.03, 0.03, 0.03, 0.03]
+    result = compute_event_study_for_class(car_values)
+    assert result["sigma_pct"] == 0.0
+    assert result["t_statistic"] is None
+    assert result["p_value"] is None
+    assert result["significant"] is None
+    assert "varianza cero" in result["conclusion"]
+    # No debe quedar ningún float no-finito en el resultado — es justo lo
+    # que rompía la serialización a JSON.
+    for v in result.values():
+        if isinstance(v, float):
+            assert math.isfinite(v)
 
 
 # ---------------------------------------------------------------------------

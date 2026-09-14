@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import date, datetime
 from pathlib import Path
 
@@ -17,6 +18,26 @@ from pipeline.backtest.portfolio_report import run_full_backtest
 from pipeline.backtest.sensitivity import run_sensitivity_analysis
 from pipeline.validation.decision import generate_decision
 from pipeline.validation.event_study import run_event_study
+
+
+def _json_safe(obj):
+    """Reemplaza inf/-inf/NaN por None recursivamente. JSON no tiene token
+    para "infinito" — Postgres rechaza el INSERT completo si CUALQUIER
+    número del payload es no-finito (se encontró así, con
+    event_study.py:compute_event_study_for_class produciendo t_statistic=
+    Infinity en una clase de varianza cero — ya corregido en la fuente).
+    Se mantiene esta red aquí, en el único punto de persistencia de
+    validation_reports, como defensa en profundidad: si mañana sensitivity.py
+    u otra métrica divide por cero en un caso no previsto, el paso nocturno
+    no debe reventar por un JSON inválido — debe guardar None en vez de
+    fabricar un número, mismo principio que el resto del proyecto."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
 
 VERSION_ORDER = ("CONSERVATIVE", "BALANCED", "AGGRESSIVE")
 _OPTION_RANK = {"A": 0, "B": 1, "C": 2}  # A es mejor -> rank más bajo
@@ -340,7 +361,7 @@ def persist_validation_report(conn, run_batch_tag: str) -> dict:
             VALUES (%(tag)s, %(report)s)
             ON CONFLICT (run_batch_tag) DO UPDATE SET report_json = EXCLUDED.report_json, created_at = now()
             """,
-            {"tag": run_batch_tag, "report": json.dumps(payload)},
+            {"tag": run_batch_tag, "report": json.dumps(_json_safe(payload))},
         )
     conn.commit()
     return payload

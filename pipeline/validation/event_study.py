@@ -70,15 +70,28 @@ def compute_event_study_for_class(car_values: list[float]) -> dict:
     p25, p75 = (float(x) for x in np.percentile(arr, [25, 75]))
     mde = compute_mde(sigma, n)
 
-    t_stat, p_value = stats.ttest_1samp(arr, popmean=0.0)
-    t_stat, p_value = float(t_stat), float(p_value)
-    significant = p_value < SIGNIFICANCE_ALPHA
-
-    if significant:
-        conclusion = f"Significativo (p={p_value:.4f} < {SIGNIFICANCE_ALPHA}) — el evento SÍ mueve el precio de forma no aleatoria"
+    if sigma == 0.0:
+        # Varianza cero (todos los CAR de la clase son idénticos — con n
+        # pequeño y datos reales puede pasar de verdad, no solo en
+        # fixtures de test). t = media/(sigma/√n) es una división por 0:
+        # scipy devuelve Infinity/NaN, que ni siquiera es JSON válido
+        # (Postgres lo rechaza al persistir en validation_reports — se
+        # encontró exactamente así, con el pipeline nocturno real). No hay
+        # una "significancia" que testear sobre una muestra sin dispersión;
+        # se reporta como no computable, no como un número inventado.
+        t_stat, p_value, significant = None, None, None
+        conclusion = f"n={n} — varianza cero en la muestra (todos los CAR idénticos), t-test no aplicable"
     else:
+        t_stat, p_value = stats.ttest_1samp(arr, popmean=0.0)
+        t_stat, p_value = float(t_stat), float(p_value)
+        significant = p_value < SIGNIFICANCE_ALPHA
+
+    if significant is True:
+        conclusion = f"Significativo (p={p_value:.4f} < {SIGNIFICANCE_ALPHA}) — el evento SÍ mueve el precio de forma no aleatoria"
+    elif significant is False:
         detectable_note = f"MDE={mde:.0f} bps con esta n" if mde is not None else ""
         conclusion = f"No significativo (p={p_value:.4f} >= {SIGNIFICANCE_ALPHA}) — {detectable_note}, podría ser ruido o un efecto real más pequeño que el MDE"
+    # significant is None: conclusion ya se fijó en la rama sigma==0.0 de arriba.
 
     return {
         "n": n,
