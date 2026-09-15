@@ -41,25 +41,22 @@ BATCH_SIZE = 50           # tickers por lote — margen de sobra bajo el umbral 
 PAUSE_BETWEEN_BATCHES_S = 5
 MAX_RETRIES = 4
 BACKOFF_BASE_S = 2         # 2, 4, 8, 16 — misma política que el resto del proyecto
+DOWNLOAD_THREADS = 8       # descargas en paralelo dentro de un lote (ver _descargar_lote_con_reintentos)
 
 
 def _trading_days_expected(start: date, end: date) -> set[date]:
-    """Aproximación de días hábiles de mercado (lunes-viernes, sin festivos).
+    """Días en los que la bolsa abre de verdad, festivos incluidos.
 
-    Es deliberadamente conservadora: no conocer los festivos de NYSE exactos
-    generará algún falso positivo de 'gap' en días festivos reales. Esto es
-    aceptable porque el flag es una SEÑAL DE ALERTA, no una verdad absoluta —
-    el objetivo es no dejar pasar en silencio un hueco real de deslistado.
-    Fase 2 (Norgate/Sharadar, ver DATA_REQUIREMENTS_PHASED.md) trae calendario
-    de festivos correcto.
+    ANTES era lunes-viernes a secas, con un comentario que daba los falsos
+    positivos por "aceptables porque el flag es una SEÑAL DE ALERTA". No lo
+    eran: en el primer run con precios reales marcó 14 huecos en CASI LOS 150
+    tickers, 3M y Adobe entre ellos, y los 14 eran exactamente los festivos del
+    rango. Una alerta que salta en todos los casos a la vez no avisa de nada —
+    tapaba justo lo que tenía que detectar.
     """
-    days = set()
-    d = start
-    while d <= end:
-        if d.weekday() < 5:
-            days.add(d)
-        d += timedelta(days=1)
-    return days
+    from pipeline.ingest.market_calendar import dias_de_negociacion
+
+    return dias_de_negociacion(start, end)
 
 
 COLUMNAS_REQUERIDAS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
@@ -85,9 +82,22 @@ def aplanar_columnas(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     for nivel in range(df.columns.nlevels):
         if set(df.columns.get_level_values(nivel)) <= {ticker}:
             return df.droplevel(nivel, axis=1)
-    # Ningún nivel es solo el ticker (no debería pasar pidiendo uno solo). Se
-    # cae al comportamiento por defecto de yfinance, que lo pone el último.
-    return df.droplevel(-1, axis=1)
+    return df.droplevel(nivel_de_tickers(df.columns), axis=1)
+
+
+def nivel_de_tickers(columnas: pd.MultiIndex) -> int:
+    """Cuál de los dos niveles lleva los tickers y cuál los campos.
+
+    Se identifica por el CONTENIDO, no por la posición: el nivel de campos es
+    el que trae 'Open', 'Close' y compañía; el otro es el de tickers. Así el
+    código aguanta que yfinance invierta el orden de los niveles, que es
+    justamente el tipo de suposición sobre un formato ajeno que ya ha costado
+    varios fallos en producción en este proyecto.
+    """
+    for nivel in range(columnas.nlevels):
+        if not set(columnas.get_level_values(nivel)) & set(COLUMNAS_REQUERIDAS):
+            return nivel
+    return columnas.nlevels - 1  # por defecto de yfinance, el ticker va el último
 
 
 def _validar_columnas(df: pd.DataFrame, ticker: str) -> None:
@@ -130,24 +140,183 @@ def _download_one_with_retry(ticker: str, start: date, end: date) -> pd.DataFram
     return None
 
 
-def backfill_tickers(tickers: list[str], start: date, end: date) -> None:
+def _descargar_lote_con_reintentos(tickers: list[str], start: date, end: date) -> pd.DataFrame | None:
+    """Un lote entero en UNA sola petición.
+
+    POR QUÉ (medido en producción, run 34943861450): descargando de uno en uno,
+    150 tickers tardaron ~60 minutos, a razón de 2,5 por minuto. No es un
+    problema de hoy sino de mañana: el universo crece con cada día ingestado, y
+    a este ritmo la pasada nocturna deja de caber en la noche.
+
+    yf.download acepta una lista y devuelve las columnas como (campo, ticker) —
+    que es, precisamente, POR QUÉ venían en dos niveles y reventaba float():
+    la librería llevaba todo el tiempo preparada para el modo por lotes y se
+    estaba usando de una en una.
+    """
+    import yfinance as yf
+
+    for intento in range(MAX_RETRIES):
+        try:
+            return yf.download(
+                tickers,
+                start=start.isoformat(),
+                end=(end + timedelta(days=1)).isoformat(),
+                auto_adjust=False,
+                progress=False,
+                # threads=False hacía que yfinance recorriera el lote EN SERIE
+                # por dentro: agrupar no quitaba ni una petición, solo movía el
+                # bucle dentro de la librería. Por eso el primer run con lotes
+                # tardó lo mismo (1h 24m). Un número modesto y explícito, no
+                # True: el límite de Yahoo no está documentado y con 50 hilos a
+                # la vez el 429 es seguro.
+                threads=DOWNLOAD_THREADS,
+            )
+        except Exception as exc:  # yfinance no tiene jerarquía de excepciones estable
+            espera = BACKOFF_BASE_S * (2**intento)
+            logger.warning(
+                "Fallo descargando el lote de %d tickers (intento %d): %s — esperando %ds",
+                len(tickers), intento, exc, espera,
+            )
+            time.sleep(espera)
+    logger.error("El lote de %d tickers falló tras %d intentos", len(tickers), MAX_RETRIES)
+    return None
+
+
+def extraer_ticker_del_lote(df: pd.DataFrame | None, ticker: str) -> pd.DataFrame | None:
+    """Saca de la descarga por lotes el sub-DataFrame de un ticker.
+
+    Devuelve None cuando el lote no trae nada utilizable de ese ticker (no
+    aparece en las columnas, o viene entero a NaN porque está deslistado). El
+    caller lo reintenta entonces de uno en uno: si alguna suposición sobre la
+    forma del lote es errónea, el peor caso es volver al comportamiento
+    anterior —lento pero correcto— en vez de perder precios en silencio.
+    """
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        nivel = nivel_de_tickers(df.columns)
+        if ticker not in set(df.columns.get_level_values(nivel)):
+            return None
+        propio = df.xs(ticker, axis=1, level=nivel)
+    else:
+        # Un lote de un solo ticker puede volver ya plano.
+        propio = df
+
+    propio = propio.dropna(how="all")
+    return propio if not propio.empty else None
+
+
+def ultimo_dia_guardado(conn, tickers: list[str]) -> dict[str, date]:
+    """Último día con precio ya almacenado, por ticker."""
+    if not tickers:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ticker, MAX(trade_date) AS ultimo FROM prices "
+            "WHERE ticker = ANY(%s) AND close_raw IS NOT NULL GROUP BY ticker",
+            (list(tickers),),
+        )
+        return {r["ticker"]: r["ultimo"] for r in cur.fetchall() if r["ultimo"] is not None}
+
+
+def pendientes_de_descarga(
+    ultimo_por_ticker: dict[str, date], tickers: list[str], start: date, end: date
+) -> tuple[list[tuple[str, date]], list[str]]:
+    """Reparte los tickers en (los que hay que pedir, con desde qué fecha) y
+    (los que ya están al día).
+
+    POR QUÉ (medido: 1h 24m en el run 34948... para volver a bajar exactamente
+    lo que ya estaba en la base de datos): el paso se reejecuta en cada pasada
+    y volvía a pedir el rango COMPLETO de los ~500 días de cada ticker, aunque
+    la ejecución anterior ya los hubiera guardado. Descargar solo lo que falta
+    convierte una reejecución de hora y media en segundos.
+
+    Es coherente con el diseño del módulo: close_raw y adj_factor se guardan
+    por separado precisamente para que el histórico no haya que rebajarlo
+    cuando cambian los ajustes por splits y dividendos (ver cabecera). Para
+    forzar una redescarga completa está --forzar.
+    """
+    a_pedir: list[tuple[str, date]] = []
+    al_dia: list[str] = []
+    for ticker in tickers:
+        ultimo = ultimo_por_ticker.get(ticker)
+        if ultimo is None:
+            a_pedir.append((ticker, start))  # nunca descargado: rango entero
+            continue
+        desde = max(start, ultimo + timedelta(days=1))
+        if desde > end:
+            al_dia.append(ticker)
+        else:
+            a_pedir.append((ticker, desde))
+    return a_pedir, al_dia
+
+
+def backfill_tickers(tickers: list[str], start: date, end: date, forzar: bool = False) -> None:
     from pipeline.db.connection import get_connection
 
     conn = get_connection()
     expected_days = _trading_days_expected(start, end)
 
+    if forzar:
+        a_pedir, al_dia = [(t, start) for t in tickers], []
+    else:
+        a_pedir, al_dia = pendientes_de_descarga(
+            ultimo_dia_guardado(conn, tickers), tickers, start, end
+        )
+    if al_dia:
+        logger.info("%d de %d tickers ya al día, no se vuelven a pedir", len(al_dia), len(tickers))
+    if not a_pedir:
+        logger.info("Nada que descargar: los %d tickers ya cubren hasta %s", len(tickers), end)
+        return
+
+    # Se agrupan por fecha de inicio para que cada lote sea una sola petición
+    # con un rango común. En la práctica casi todos comparten fecha.
+    por_fecha: dict[date, list[str]] = {}
+    for ticker, desde in a_pedir:
+        por_fecha.setdefault(desde, []).append(ticker)
+
+    for desde, tickers_desde in sorted(por_fecha.items()):
+        logger.info("%d tickers a descargar desde %s", len(tickers_desde), desde)
+        _descargar_grupo(conn, tickers_desde, desde, end, expected_days)
+    logger.info("Backfill de precios completo para %d tickers", len(tickers))
+
+
+def _descargar_grupo(conn, tickers: list[str], start: date, end: date, expected_days: set[date]) -> None:
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i : i + BATCH_SIZE]
         logger.info("Lote %d-%d de %d tickers", i, i + len(batch), len(tickers))
+
+        lote = _descargar_lote_con_reintentos(batch, start, end)
+        pendientes = []
         for ticker in batch:
+            df = extraer_ticker_del_lote(lote, ticker)
+            if df is None:
+                pendientes.append(ticker)
+                continue
+            _store_with_gap_detection(conn, ticker, df, expected_days)
+
+        # Red de seguridad: lo que el lote no trajo se reintenta de uno en uno
+        # ANTES de darlo por deslistado. Un ticker ausente del lote puede serlo
+        # por estar deslistado de verdad, pero también porque alguna suposición
+        # sobre la forma del resultado sea errónea — y no se ha podido validar
+        # contra el servidor real desde el entorno de desarrollo. Con esto, el
+        # peor caso de equivocarse es tardar lo que se tardaba antes, no
+        # marcar como deslistadas 150 empresas que cotizan perfectamente.
+        if pendientes:
+            logger.info(
+                "%d de %d tickers del lote no vinieron en la descarga conjunta, "
+                "se piden de uno en uno", len(pendientes), len(batch),
+            )
+        for ticker in pendientes:
             df = _download_one_with_retry(ticker, start, end)
             if df is None or df.empty:
                 logger.warning("Sin datos para %s en absoluto — probable deslistado total", ticker)
                 _flag_full_gap(conn, ticker, start, end)
                 continue
             _store_with_gap_detection(conn, ticker, df, expected_days)
+
         time.sleep(PAUSE_BETWEEN_BATCHES_S)
-    logger.info("Backfill de precios completo para %d tickers", len(tickers))
 
 
 def _flag_full_gap(conn, ticker: str, start: date, end: date) -> None:
@@ -229,6 +398,11 @@ if __name__ == "__main__":
     parser.add_argument("--tickers", type=str, required=True, help="Fichero con un ticker por línea, o lista separada por comas")
     parser.add_argument("--start", type=str, default=config.BACKTEST_START)
     parser.add_argument("--end", type=str, default=config.BACKTEST_END)
+    parser.add_argument(
+        "--forzar",
+        action="store_true",
+        help="Rebaja el rango entero aunque ya esté guardado (por defecto solo se pide lo que falta)",
+    )
     args = parser.parse_args()
 
     from datetime import datetime as _dt
@@ -243,4 +417,5 @@ if __name__ == "__main__":
         ticker_list,
         _dt.strptime(args.start, "%Y-%m-%d").date(),
         _dt.strptime(args.end, "%Y-%m-%d").date(),
+        forzar=args.forzar,
     )

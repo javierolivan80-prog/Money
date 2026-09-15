@@ -125,8 +125,34 @@ def _extract_concept_by_period(facts: dict, concept: str) -> dict[date, tuple[da
     return {}
 
 
-def parse_company_facts(facts: dict) -> list[dict]:
+def normalizar_cik(cik) -> str:
+    """CIK en la forma canónica del proyecto: dígitos sin ceros a la izquierda.
+
+    BUG REAL (2026-09-15, run 34943861450). La tabla universe guarda el CIK
+    como viene del daily-index, sin rellenar ('1119190'). La API de
+    companyfacts lo devuelve rellenado a 10 dígitos ('0001119190'). Son la
+    misma empresa y para Postgres son dos cadenas distintas:
+
+        insert or update on table "fundamentals" violates foreign key
+        constraint "fundamentals_cik_fkey"
+        DETAIL: Key (cik)=(0001119190) is not present in table "universe".
+
+    Cualquier sitio donde un CIK cruce la frontera entre dos fuentes tiene que
+    pasar por aquí. El CIK se usa además como clave ajena contra universe, así
+    que una diferencia de formato no da un dato raro: rompe la inserción.
+    """
+    texto = str(cik).strip().upper().removeprefix("CIK").lstrip("0")
+    if not texto.isdigit():
+        raise ValueError(f"CIK con formato inesperado: {cik!r}")
+    return texto
+
+
+def parse_company_facts(facts: dict, cik: str | None = None) -> list[dict]:
     """Convierte el JSON de companyfacts en una fila por ejercicio.
+
+    `cik` es el CIK con el que se pidió la descarga. Se usa ese y no el que
+    echa de vuelta la API porque el de universe es el que manda: es la clave
+    ajena contra la que se inserta. Ambos se normalizan de todos modos.
 
     Separado de la descarga para poder probarse sin red. Una magnitud que no
     aparece bajo ninguna etiqueta conocida queda como None en esa fila — no se
@@ -138,9 +164,12 @@ def parse_company_facts(facts: dict) -> list[dict]:
     disponible antes de que todos sus campos existieran, que es look-ahead
     dentro de la propia fila.
     """
-    cik = facts.get("cik")
-    if cik is None:
+    cik_facts = facts.get("cik")
+    if cik_facts is None and cik is None:
         raise ValueError("companyfacts sin campo 'cik'")
+    # Se prefiere el CIK con el que se PIDIÓ la descarga (el de universe) sobre
+    # el que devuelve la API: ver normalizar_cik.
+    cik_fila = normalizar_cik(cik if cik is not None else cik_facts)
 
     per_concept = {concept: _extract_concept_by_period(facts, concept) for concept in _CONCEPT_TAGS}
 
@@ -148,7 +177,7 @@ def parse_company_facts(facts: dict) -> list[dict]:
 
     rows = []
     for period_end in all_periods:
-        row: dict = {"cik": str(cik), "fiscal_period_end": period_end, "form": ANNUAL_FORM}
+        row: dict = {"cik": cik_fila, "fiscal_period_end": period_end, "form": ANNUAL_FORM}
         filed_dates = []
         for concept, values in per_concept.items():
             found = values.get(period_end)
@@ -216,6 +245,19 @@ def ingest_universe_fundamentals(conn, limit: int | None = None) -> dict:
     Un fallo en una empresa concreta (CIK sin XBRL, JSON inesperado) no aborta
     el resto: se registra y se sigue. Con cientos de empresas, que una rompa
     toda la ingesta nocturna sería peor que perder esa empresa.
+
+    ESO ERA LO QUE PROMETÍA ESTE DOCSTRING Y NO LO QUE PASABA (2026-09-15, run
+    34943861450): un error de Postgres deja la transacción abortada, y hasta
+    que no se hace rollback TODA sentencia posterior falla con "current
+    transaction is aborted". Un único CIK con problema de formato se llevó por
+    delante a las 134 empresas siguientes:
+
+        CIK 1119190: violates foreign key constraint ... (el error de verdad)
+        CIK 1126328: current transaction is aborted ...  (y 134 más iguales)
+
+    El contador decía "135 empresas fallidas" cuando el fallo era uno. Sin el
+    rollback, capturar la excepción no aísla nada: solo esconde el error real
+    detrás de cien copias de su consecuencia.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -226,14 +268,31 @@ def ingest_universe_fundamentals(conn, limit: int | None = None) -> dict:
         ciks = [r["cik"] for r in cur.fetchall()]
 
     stored, failed = 0, 0
+    primer_error: str | None = None
     for cik in ciks:
         try:
             facts = fetch_company_facts(cik)
-            rows = parse_company_facts(facts)
+            rows = parse_company_facts(facts, cik=cik)
             stored += store_fundamentals(conn, rows)
         except Exception as exc:  # noqa: BLE001 — ver docstring
             failed += 1
+            if primer_error is None:
+                primer_error = f"CIK {cik}: {exc}"
             logger.warning("Sin fundamentales para CIK %s: %s", cik, exc)
+            # SIN ESTO no se aísla nada: la transacción queda abortada y las
+            # empresas siguientes fallan en cadena (ver docstring).
+            conn.rollback()
+
+    if failed:
+        # El primer error es el único que suele importar; los demás son
+        # repeticiones o consecuencias. Repetirlo al final evita tener que
+        # rebobinar cien líneas de log para encontrarlo.
+        logger.warning("Primer fallo de la ingesta de fundamentales — %s", primer_error)
+    if ciks and failed == len(ciks):
+        logger.warning(
+            "NINGUNA de las %d empresas devolvió cuentas: eso no son huecos "
+            "sueltos de XBRL, es un problema común a todas.", len(ciks),
+        )
 
     logger.info("Fundamentales: %d filas guardadas, %d empresas fallidas de %d", stored, failed, len(ciks))
     return {"n_ciks": len(ciks), "n_rows_stored": stored, "n_failed": failed}

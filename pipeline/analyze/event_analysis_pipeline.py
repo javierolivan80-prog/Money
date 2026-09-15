@@ -143,6 +143,12 @@ def process_chunk(conn, client, event_rows: list[dict]) -> None:
             _process_single_event(conn, ev, cache_hits.get(ev["event_id"]), bull_bear_results, judge_results, bb_batch_id, judge_batch_id)
         except Exception:
             logger.exception("Fallo analizando evento %d — se continúa con el siguiente", ev["event_id"])
+            # Sin rollback, "se continúa con el siguiente" es mentira cuando el
+            # fallo viene de Postgres: la transacción queda abortada y TODOS
+            # los eventos siguientes fallan con "current transaction is
+            # aborted". Pasó exactamente así en la ingesta de fundamentales
+            # (run 34943861450): un error real y 134 copias de su consecuencia.
+            conn.rollback()
 
 
 def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_results: dict, judge_results: dict, bb_batch_id: str | None, judge_batch_id: str | None) -> None:
@@ -342,10 +348,30 @@ if __name__ == "__main__":
     import anthropic
 
     logging.basicConfig(level=logging.INFO)
+    from pipeline import config
     from pipeline.db.connection import get_connection
 
+    # Comprobación por delante, antes de tocar la base de datos. Sin esto, la
+    # falta de la clave sale como un TypeError desde las tripas del SDK
+    # ("Could not resolve authentication method...") veinte líneas de traza más
+    # abajo, que no dice qué hay que hacer ni quién tiene que hacerlo.
+    if not config.ANTHROPIC_API_KEY:
+        raise SystemExit(
+            "Falta ANTHROPIC_API_KEY. Este paso es el único del pipeline que la\n"
+            "necesita: es el que construye el debate Bull/Bear/Juez de cada evento.\n"
+            "Se configura como secreto del repositorio en GitHub:\n"
+            "  Settings > Secrets and variables > Actions > New repository secret\n"
+            "  Nombre: ANTHROPIC_API_KEY\n"
+            "Sin ella no se generan señales nuevas, pero el resto del pipeline\n"
+            "(precios, CAR, backtest, validación, largo plazo) sigue funcionando."
+        )
+
     conn = get_connection()
-    client = anthropic.Anthropic()  # requiere ANTHROPIC_API_KEY
+    # api_key EXPLÍCITO: ver la nota en adversarial_analyzer.py. Sin esto, el
+    # chequeo de arriba puede pasar (la variable existe) y aun así reventar
+    # más abajo si el secreto trae un salto de línea, porque la librería sin
+    # argumentos lee la variable de entorno tal cual, no la ya limpiada.
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     processed = run_pipeline(conn, client)
     print(f"Procesados {processed} eventos")

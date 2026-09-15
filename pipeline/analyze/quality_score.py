@@ -43,6 +43,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -319,42 +320,76 @@ def run_quality_screen(conn, as_of_date: date | None = None) -> dict:
         )
         companies = [(r["cik"], r["ticker"]) for r in cur.fetchall()]
 
-    stored = 0
+    stored, fallidas, primer_error = 0, 0, None
     for cik, ticker in companies:
-        rows = fetch_annual_rows(conn, cik, as_of_date=as_of_date)
-        if not rows:
-            continue
-        price = _fetch_latest_price(conn, ticker, as_of_date=as_of_date)
-        score = compute_quality_score(rows, current_price=price)
+        try:
+            stored += _puntuar_una_empresa(conn, cik, ticker, as_of_date, effective_date)
+        except Exception as exc:  # noqa: BLE001
+            # Una empresa con un dato raro no puede tumbar la pasada nocturna
+            # entera. Es lo que pasó en el run 34943861450: un Decimal donde se
+            # esperaba un float reventó en la primera empresa y se llevó por
+            # delante el paso completo, con el resto del pipeline detrás.
+            fallidas += 1
+            if primer_error is None:
+                primer_error = f"CIK {cik} ({ticker}): {exc}"
+            logger.warning("Sin nota de calidad para CIK %s (%s): %s", cik, ticker, exc)
+            conn.rollback()  # ver el mismo razonamiento en xbrl_fundamentals
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO quality_scores (cik, as_of_date, total_score, verdict, components, n_years, price_used)
-                VALUES (%(cik)s, %(as_of)s, %(total)s, %(verdict)s, %(components)s, %(n_years)s, %(price)s)
-                ON CONFLICT (cik, as_of_date) DO UPDATE SET
-                    total_score = EXCLUDED.total_score,
-                    verdict = EXCLUDED.verdict,
-                    components = EXCLUDED.components,
-                    n_years = EXCLUDED.n_years,
-                    price_used = EXCLUDED.price_used,
-                    computed_at = now()
-                """,
-                {
-                    "cik": cik,
-                    "as_of": effective_date,
-                    "total": score.total,
-                    "verdict": score.verdict,
-                    "components": json.dumps(score.as_json()["components"]),
-                    "n_years": score.n_years,
-                    "price": price,
-                },
-            )
-        stored += 1
-    conn.commit()
+    if fallidas:
+        logger.warning(
+            "%d de %d empresas sin nota. Primer fallo — %s", fallidas, len(companies), primer_error
+        )
+    if companies and fallidas == len(companies):
+        logger.warning(
+            "NINGUNA de las %d empresas pudo puntuarse: eso no son datos que "
+            "falten, es un fallo común a todas.", len(companies),
+        )
 
     logger.info("Notas de calidad: %d empresas evaluadas (as_of=%s)", stored, effective_date)
-    return {"as_of_date": effective_date.isoformat(), "n_companies": len(companies), "n_scored": stored}
+    return {
+        "as_of_date": effective_date.isoformat(),
+        "n_companies": len(companies),
+        "n_scored": stored,
+        "n_failed": fallidas,
+    }
+
+
+def _puntuar_una_empresa(conn, cik: str, ticker: str, as_of_date: date | None, effective_date: date) -> int:
+    """Calcula y guarda la nota de UNA empresa. Devuelve 1 si la guardó, 0 si
+    no había cuentas que puntuar."""
+    rows = fetch_annual_rows(conn, cik, as_of_date=as_of_date)
+    if not rows:
+        return 0
+    price = _fetch_latest_price(conn, ticker, as_of_date=as_of_date)
+    score = compute_quality_score(rows, current_price=price)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO quality_scores (cik, as_of_date, total_score, verdict, components, n_years, price_used)
+            VALUES (%(cik)s, %(as_of)s, %(total)s, %(verdict)s, %(components)s, %(n_years)s, %(price)s)
+            ON CONFLICT (cik, as_of_date) DO UPDATE SET
+                total_score = EXCLUDED.total_score,
+                verdict = EXCLUDED.verdict,
+                components = EXCLUDED.components,
+                n_years = EXCLUDED.n_years,
+                price_used = EXCLUDED.price_used,
+                computed_at = now()
+            """,
+            {
+                "cik": cik,
+                "as_of": effective_date,
+                "total": score.total,
+                "verdict": score.verdict,
+                "components": json.dumps(score.as_json()["components"]),
+                "n_years": score.n_years,
+                "price": price,
+            },
+        )
+    # Commit por empresa: así un fallo posterior no se lleva por delante las
+    # notas ya calculadas, y el rollback del caller solo deshace la que falló.
+    conn.commit()
+    return 1
 
 
 def fetch_annual_rows(conn, cik: str, as_of_date: date | None = None) -> list[dict]:
@@ -378,7 +413,30 @@ def fetch_annual_rows(conn, cik: str, as_of_date: date | None = None) -> list[di
                 "SELECT * FROM fundamentals WHERE cik = %s AND filed_at <= %s ORDER BY fiscal_period_end",
                 (cik, as_of_date),
             )
-        return [dict(r) for r in cur.fetchall()]
+        return [_a_float(dict(r)) for r in cur.fetchall()]
+
+
+def _a_float(fila: dict) -> dict:
+    """Convierte los Decimal de Postgres a float en la frontera de lectura.
+
+    BUG REAL (2026-09-15, run 34943861450): las columnas NUMERIC vuelven como
+    decimal.Decimal, y todo este módulo está escrito y tipado para float. La
+    mezcla revienta:
+
+        TypeError: unsupported operand type(s) for ** or pow():
+                   'decimal.Decimal' and 'float'
+
+    en (last / first) ** (1 / years) del cálculo de crecimiento. No era un caso
+    aislado: _score_calidad_beneficio hace `operating_cash_flow - 0.0` cuando
+    no hay capex, y _score_solidez y _score_precio mezclan igual. Arreglar solo
+    la línea que petó habría dejado los otros tres esperando a la primera
+    empresa que llegara con ese hueco.
+
+    Se convierte aquí, en el único punto por el que entran estos datos, y no en
+    cada operación: así el resto del módulo puede seguir asumiendo float, que
+    es lo que dicen sus firmas.
+    """
+    return {k: float(v) if isinstance(v, Decimal) else v for k, v in fila.items()}
 
 
 if __name__ == "__main__":

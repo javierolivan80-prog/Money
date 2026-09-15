@@ -262,8 +262,13 @@ if __name__ == "__main__":
 
     from pipeline.db.connection import get_connection
 
+    from pipeline import config
+
     conn = get_connection()
-    client = anthropic.Anthropic()  # requiere ANTHROPIC_API_KEY en el entorno
+    # api_key EXPLÍCITO, no el default de la librería (que lee la variable de
+    # entorno sin pasar por config.py y por tanto sin el .strip() de un
+    # secreto con salto de línea al final — ver la nota en config.py).
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     with conn.cursor() as cur:
         cur.execute(

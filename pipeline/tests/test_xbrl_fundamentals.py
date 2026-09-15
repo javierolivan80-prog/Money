@@ -157,3 +157,146 @@ def test_cik_se_guarda_como_texto_para_casar_con_universe():
     rows = parse_company_facts(facts)
     assert rows[0]["cik"] == "320193"
     assert isinstance(rows[0]["cik"], str)
+
+
+# --- CIK con ceros a la izquierda -------------------------------------------
+#
+# Run 34943861450: universe guarda '1119190' (como viene del daily-index) y la
+# API de companyfacts devuelve '0001119190'. Misma empresa, dos cadenas
+# distintas para Postgres, y el CIK es clave ajena contra universe:
+#
+#     violates foreign key constraint "fundamentals_cik_fkey"
+#     DETAIL: Key (cik)=(0001119190) is not present in table "universe".
+
+
+@pytest.mark.parametrize(
+    "entrada",
+    ["0001119190", "1119190", 1119190, "CIK0001119190", " 0001119190 "],
+)
+def test_normalizar_cik_deja_todas_las_formas_iguales(entrada):
+    from pipeline.ingest.xbrl_fundamentals import normalizar_cik
+
+    assert normalizar_cik(entrada) == "1119190"
+
+
+def test_normalizar_cik_rechaza_lo_que_no_es_un_cik():
+    from pipeline.ingest.xbrl_fundamentals import normalizar_cik
+
+    with pytest.raises(ValueError, match="formato inesperado"):
+        normalizar_cik("no-soy-un-cik")
+
+
+def test_las_filas_salen_con_el_cik_sin_rellenar():
+    """EL fallo: la API devuelve el CIK rellenado a 10 dígitos y así entraba en
+    la tabla, rompiendo la clave ajena contra universe."""
+    from pipeline.ingest.xbrl_fundamentals import parse_company_facts
+
+    facts = _facts(
+        Revenues=[_fact("2023-12-31", "2024-02-15", 1_000_000.0)],
+        NetIncomeLoss=[_fact("2023-12-31", "2024-02-15", 100_000.0)],
+    )
+    facts["cik"] = "0001119190"  # como lo devuelve companyfacts de verdad
+    for fila in parse_company_facts(facts):
+        assert fila["cik"] == "1119190"
+
+
+def test_manda_el_cik_con_el_que_se_pidio_la_descarga():
+    """universe es la fuente de la verdad para el CIK: es la clave ajena contra
+    la que se inserta. Si la API contesta con otro, se usa el de universe."""
+    from pipeline.ingest.xbrl_fundamentals import parse_company_facts
+
+    facts = _facts(
+        Revenues=[_fact("2023-12-31", "2024-02-15", 1_000_000.0)],
+        NetIncomeLoss=[_fact("2023-12-31", "2024-02-15", 100_000.0)],
+    )
+    facts["cik"] = "0009999999"  # la API contesta con otro CIK
+    for fila in parse_company_facts(facts, cik="1119190"):
+        assert fila["cik"] == "1119190"
+
+
+# --- Aislamiento de fallos --------------------------------------------------
+
+
+class _ConexionFalsa:
+    """Imita a psycopg en lo único que importa aquí: tras un error, la
+    transacción queda ABORTADA y toda sentencia siguiente falla hasta que se
+    hace rollback. Sin eso, el test pasaría igual con y sin el arreglo."""
+
+    def __init__(self, ciks, cik_que_falla):
+        self.ciks = ciks
+        self.cik_que_falla = cik_que_falla
+        self.abortada = False
+        self.rollbacks = 0
+        self.guardados = []
+
+    def cursor(self):
+        conexion = self
+
+        class _Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, *a, **kw):
+                if conexion.abortada:
+                    raise RuntimeError("current transaction is aborted, commands ignored")
+
+            def executemany(self, *a, **kw):
+                self.execute()
+
+            def fetchall(self):
+                return [{"cik": c} for c in conexion.ciks]
+
+        return _Cursor()
+
+    def commit(self):
+        if self.abortada:
+            raise RuntimeError("current transaction is aborted, commands ignored")
+
+    def rollback(self):
+        self.rollbacks += 1
+        self.abortada = False
+
+
+def test_un_cik_roto_no_se_lleva_por_delante_a_los_demas(monkeypatch):
+    """EL fallo de producción: un solo CIK con la clave ajena mal dejó la
+    transacción abortada y las 134 empresas siguientes fallaron en cadena con
+    'current transaction is aborted'. El contador dijo '135 fallidas' cuando el
+    fallo era UNO."""
+    from pipeline.ingest import xbrl_fundamentals as xf
+
+    ciks = ["111", "222", "333", "444"]
+    conn = _ConexionFalsa(ciks, cik_que_falla="222")
+
+    monkeypatch.setattr(xf, "fetch_company_facts", lambda cik: {"cik": cik, "facts": {"us-gaap": {}}})
+    monkeypatch.setattr(xf, "parse_company_facts", lambda facts, cik=None: [{"cik": cik or facts["cik"]}])
+
+    def _store(conexion, filas):
+        if filas[0]["cik"] == conn.cik_que_falla:
+            conn.abortada = True
+            raise RuntimeError('violates foreign key constraint "fundamentals_cik_fkey"')
+        conexion.commit()
+        conn.guardados.append(filas[0]["cik"])
+        return len(filas)
+
+    monkeypatch.setattr(xf, "store_fundamentals", _store)
+
+    resultado = xf.ingest_universe_fundamentals(conn)
+
+    assert resultado["n_failed"] == 1           # uno, no cuatro
+    assert conn.guardados == ["111", "333", "444"]  # los de después SÍ se guardan
+    assert conn.rollbacks == 1
+
+
+def test_sin_rollback_el_fallo_se_propagaria(monkeypatch):
+    """Comprobación de que el test de arriba no pasa por casualidad: si se
+    quita el rollback, la cascada reaparece. Lo que se verifica es que la
+    conexión falsa REPRODUCE el comportamiento de Postgres."""
+    conn = _ConexionFalsa(["111"], cik_que_falla="111")
+    conn.abortada = True
+    with pytest.raises(RuntimeError, match="transaction is aborted"):
+        conn.commit()
+    conn.rollback()
+    conn.commit()  # ya no debe lanzar

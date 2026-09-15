@@ -17,6 +17,8 @@ from pipeline.ingest.yfinance_backfill import (
     COLUMNAS_REQUERIDAS,
     _validar_columnas,
     aplanar_columnas,
+    extraer_ticker_del_lote,
+    nivel_de_tickers,
 )
 
 _FECHAS = pd.to_datetime(["2026-09-09", "2026-09-10"])
@@ -107,3 +109,163 @@ def test_validar_columnas_caza_una_columna_duplicada():
     df = pd.concat([df, df[["Close"]]], axis=1)
     with pytest.raises(ValueError, match="duplicadas"):
         _validar_columnas(df, "AAPL")
+
+
+# --- Descarga por lotes -----------------------------------------------------
+#
+# Medido en producción (run 34943861450): de uno en uno, 150 tickers tardaron
+# ~60 minutos. yf.download acepta una lista — de hecho ESA es la razón de que
+# las columnas vengan en dos niveles. La librería siempre estuvo preparada para
+# el modo por lotes; se estaba usando de una en una.
+
+
+def _df_lote(tickers: list[str], vacios: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Lo que devuelve yf.download con una lista: columnas (campo, ticker).
+    Los tickers en `vacios` vienen enteros a NaN, como los deslistados."""
+    columnas, datos = [], {}
+    for campo, valores in _VALORES.items():
+        for t in tickers:
+            columnas.append((campo, t))
+            datos[(campo, t)] = [float("nan")] * len(valores) if t in vacios else valores
+    df = pd.DataFrame(datos, index=_FECHAS)
+    df.columns = pd.MultiIndex.from_tuples(columnas)
+    return df
+
+
+def test_saca_cada_ticker_del_lote_con_sus_propios_valores():
+    lote = _df_lote(["AAPL", "MSFT"])
+    for t in ("AAPL", "MSFT"):
+        propio = extraer_ticker_del_lote(lote, t)
+        assert list(propio.columns) == list(_VALORES)
+        assert list(propio["Close"]) == _VALORES["Close"]
+
+
+def test_el_sub_dataframe_del_lote_ya_sirve_para_float():
+    """Lo que importa: lo que sale del lote tiene que poder guardarse sin más
+    conversiones — es el mismo punto donde reventó float(row['Close'])."""
+    propio = extraer_ticker_del_lote(_df_lote(["AAPL", "MSFT"]), "AAPL")
+    for _, fila in propio.iterrows():
+        for columna in COLUMNAS_REQUERIDAS:
+            assert isinstance(float(fila[columna]), float)
+
+
+def test_un_ticker_que_no_viene_en_el_lote_devuelve_none():
+    """None es la señal de 'pídelo de uno en uno', no de 'está deslistado'."""
+    assert extraer_ticker_del_lote(_df_lote(["AAPL"]), "MSFT") is None
+
+
+def test_un_ticker_entero_a_nan_devuelve_none():
+    """Un deslistado viene en las columnas pero sin un solo dato. No puede
+    pasar como serie válida ni generar filas de precio."""
+    assert extraer_ticker_del_lote(_df_lote(["AAPL", "NWSLL"], vacios=("NWSLL",)), "NWSLL") is None
+    assert extraer_ticker_del_lote(_df_lote(["AAPL", "NWSLL"], vacios=("NWSLL",)), "AAPL") is not None
+
+
+def test_lote_vacio_o_ausente_devuelve_none():
+    """Si la descarga del lote falla entera, todos los tickers caen al camino
+    de uno en uno en vez de darse por perdidos."""
+    assert extraer_ticker_del_lote(None, "AAPL") is None
+    assert extraer_ticker_del_lote(pd.DataFrame(), "AAPL") is None
+
+
+def test_lote_que_vuelve_plano_se_acepta_igual():
+    """Un lote de un solo ticker puede volver sin MultiIndex."""
+    propio = extraer_ticker_del_lote(_df_plano(), "AAPL")
+    assert list(propio["Close"]) == _VALORES["Close"]
+
+
+def test_el_nivel_del_ticker_se_detecta_por_contenido_no_por_posicion():
+    """El nivel de campos es el que trae 'Open'/'Close'; el otro es el de
+    tickers. Detectarlo por contenido hace que invertir el orden de los
+    niveles no rompa nada — el tipo de suposición sobre un formato ajeno que ya
+    ha costado varios fallos en este proyecto."""
+    normal = _df_lote(["AAPL", "MSFT"])           # (campo, ticker)
+    assert nivel_de_tickers(normal.columns) == 1
+
+    invertido = normal.copy()
+    invertido.columns = pd.MultiIndex.from_tuples([(t, c) for c, t in normal.columns])
+    assert nivel_de_tickers(invertido.columns) == 0
+    assert list(extraer_ticker_del_lote(invertido, "AAPL")["Close"]) == _VALORES["Close"]
+
+
+def test_no_mezcla_valores_entre_tickers_del_mismo_lote():
+    """El fallo más caro que podría tener el modo por lotes: guardar los
+    precios de una empresa bajo el ticker de otra. Pasaría desapercibido —los
+    números son plausibles— y contaminaría todos los cálculos posteriores."""
+    columnas, datos = [], {}
+    for i, t in enumerate(["AAA", "BBB", "CCC"]):
+        for campo, valores in _VALORES.items():
+            columnas.append((campo, t))
+            datos[(campo, t)] = [v + i * 100 for v in valores]
+    lote = pd.DataFrame(datos, index=_FECHAS)
+    lote.columns = pd.MultiIndex.from_tuples(columnas)
+
+    for i, t in enumerate(["AAA", "BBB", "CCC"]):
+        propio = extraer_ticker_del_lote(lote, t)
+        assert list(propio["Close"]) == [v + i * 100 for v in _VALORES["Close"]]
+
+
+# --- No volver a bajar lo que ya está ---------------------------------------
+#
+# Medido: 1h 24m para redescargar exactamente los mismos ~500 días de 150
+# tickers que la ejecución anterior ya había guardado. El paso se reejecuta en
+# cada pasada y pedía siempre el rango completo.
+
+from datetime import date as _date
+
+from pipeline.ingest.yfinance_backfill import pendientes_de_descarga
+
+_INICIO, _FIN = _date(2025, 4, 28), _date(2026, 9, 15)
+
+
+def test_un_ticker_ya_al_dia_no_se_vuelve_a_pedir():
+    a_pedir, al_dia = pendientes_de_descarga({"AAPL": _FIN}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == []
+    assert al_dia == ["AAPL"]
+
+
+def test_un_ticker_nunca_descargado_se_pide_entero():
+    a_pedir, al_dia = pendientes_de_descarga({}, ["NUEVA"], _INICIO, _FIN)
+    assert a_pedir == [("NUEVA", _INICIO)]
+    assert al_dia == []
+
+
+def test_solo_se_pide_la_cola_que_falta():
+    """Lo que hace que una reejecución dure segundos: si hay precios hasta el
+    día 10, se piden desde el 11, no desde hace 500 días."""
+    a_pedir, _ = pendientes_de_descarga({"AAPL": _date(2026, 9, 10)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == [("AAPL", _date(2026, 9, 11))]
+
+
+def test_no_se_pide_de_nuevo_el_ultimo_dia_guardado():
+    """Se empieza en el día SIGUIENTE al último guardado. Volver a pedirlo no
+    daría datos malos —el upsert es idempotente— pero sí un día de más en cada
+    ejecución, todos los días."""
+    a_pedir, _ = pendientes_de_descarga({"AAPL": _date(2026, 9, 10)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir[0][1] > _date(2026, 9, 10)
+
+
+def test_nunca_se_pide_antes_del_inicio_solicitado():
+    """Un ticker con histórico más antiguo que el rango pedido no debe
+    ensanchar la descarga hacia atrás."""
+    a_pedir, al_dia = pendientes_de_descarga({"AAPL": _date(2020, 1, 1)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == [("AAPL", _INICIO)]
+    assert al_dia == []
+
+
+def test_el_caso_real_de_produccion_no_pide_nada():
+    """150 tickers guardados hasta la fecha final: una reejecución no debe
+    hacer ni una petición. Ese es el escenario que costó hora y media."""
+    tickers = [f"T{i}" for i in range(150)]
+    a_pedir, al_dia = pendientes_de_descarga({t: _FIN for t in tickers}, tickers, _INICIO, _FIN)
+    assert a_pedir == []
+    assert len(al_dia) == 150
+
+
+def test_mezcla_de_tickers_al_dia_nuevos_y_a_medias():
+    ultimos = {"ALDIA": _FIN, "AMEDIAS": _date(2026, 9, 1)}
+    a_pedir, al_dia = pendientes_de_descarga(
+        ultimos, ["ALDIA", "AMEDIAS", "NUEVA"], _INICIO, _FIN
+    )
+    assert al_dia == ["ALDIA"]
+    assert dict(a_pedir) == {"AMEDIAS": _date(2026, 9, 2), "NUEVA": _INICIO}
