@@ -228,6 +228,78 @@ def test_day3_stats_in_expected_range(conn):
 # ---------------------------------------------------------------------------
 
 
+class _ClientQueMataLaConexion:
+    """Imita lo que le pasó a producción (run 34964242549): mientras
+    run_batch_and_collect espera a la Batch API, la conexión a Postgres muere
+    de verdad (Neon corta las conexiones ociosas; la espera real duró unos 20
+    minutos). El primer retrieve() mata la conexión Y devuelve "ended" en la
+    misma llamada, así el test no necesita dormir de verdad."""
+
+    def __init__(self, conexion_a_matar):
+        self._conn = conexion_a_matar
+        self._matada = False
+        self._ultima_tanda = None
+
+    def create(self, requests):
+        self._ultima_tanda = requests
+        return SimpleNamespace(id="batch_mortal", processing_status="in_progress")
+
+    def retrieve(self, batch_id):
+        if not self._matada:
+            self._conn.close()
+            self._matada = True
+        return SimpleNamespace(id=batch_id, processing_status="ended")
+
+    def results(self, batch_id):
+        out = []
+        for req in self._ultima_tanda:
+            custom_id = req["custom_id"]
+            if custom_id.endswith("_bull"):
+                payload = {"thesis": "bull thesis", "upside_drivers": ["d1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["c1"]}
+            elif custom_id.endswith("_bear"):
+                payload = {"counter_thesis": "bear thesis", "downside_risks": ["r1"], "valuation_concern": "priced in", "historical_precedent": "failed at Y", "negative_catalysts": ["n1"]}
+            elif custom_id.endswith("_judge"):
+                payload = {"net_conviction": 0.6, "confidence_in_conviction": 80, "key_uncertainty": "u", "overriding_concern": "c"}
+            else:
+                continue
+            content_block = SimpleNamespace(type="text", text=json.dumps(payload))
+            message = SimpleNamespace(content=[content_block])
+            result = SimpleNamespace(type="succeeded", message=message)
+            out.append(SimpleNamespace(custom_id=custom_id, result=result))
+        return out
+
+
+def test_process_chunk_reconecta_si_la_conexion_muere_durante_la_espera_del_batch(conn):
+    """EL bug real: 20 minutos esperando la Batch API dejaban la conexión
+    ociosa hasta que Postgres la cortaba. El síntoma no salía en el batch —
+    salía en el primer INSERT de después, con "the connection is lost", y el
+    propio rollback de recuperación reventaba igual, tirando el chunk entero
+    pese a que la IA ya había respondido. process_chunk tiene que detectarlo
+    y reconectar ANTES de escribir, no después de que el primer INSERT
+    reviente."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_ClientQueMataLaConexion(conn)))
+    events = fetch_events_needing_analysis(conn)
+    assert len(events) == 1
+
+    conn_nueva = process_chunk(conn, client, events)
+
+    assert conn_nueva is not conn  # se reconectó, no siguió con la muerta
+    assert conn.closed  # la vieja, la que mató el fake client, sigue cerrada
+
+    with conn_nueva.cursor() as cur:
+        cur.execute("SELECT * FROM event_analyses")
+        rows = cur.fetchall()
+    assert len(rows) == 1  # el análisis se guardó pese a la reconexión
+    conn_nueva.close()
+
+
+
+
 def test_process_chunk_end_to_end_writes_full_event_analyses_row(conn):
     from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
 
@@ -238,7 +310,7 @@ def test_process_chunk_end_to_end_writes_full_event_analyses_row(conn):
     events = fetch_events_needing_analysis(conn)
     assert len(events) == 1
 
-    process_chunk(conn, client, events)
+    conn = process_chunk(conn, client, events)
 
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM event_analyses")
@@ -261,14 +333,14 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
 
     scripted_client = _ScriptedBatchesClient()
     client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
     assert scripted_client.call_count == 2  # una llamada para bull/bear, otra para judge
 
     # Segundo evento: mismo ticker, misma clase, fecha distinta (pero con
     # suficiente historial de precios) -> debe reusar Bull/Bear/Judge de caché
     # y NO generar nuevas llamadas al cliente.
     _seed_event(conn, "1", "TESTCO", dates[290].date())
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
 
     assert scripted_client.call_count == 2  # sin llamadas nuevas: se sirvió de caché
 
@@ -332,7 +404,7 @@ def test_process_chunk_novelty_reasoning_reflects_prior_guidance_detection(conn)
     _seed_event(conn, "1", "TESTCO", dates[280].date())
 
     client = SimpleNamespace(messages=SimpleNamespace(batches=_ScriptedBatchesClient()))
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
 
     with conn.cursor() as cur:
         cur.execute("SELECT novelty_reasoning FROM event_analyses ea JOIN events e ON e.event_id=ea.event_id WHERE e.d0_close_date = %s", (dates[280].date(),))

@@ -104,8 +104,29 @@ def check_fda_crl_without_8k(conn, cik: str, event_class: str, d0_close_date: da
         return cur.fetchone() is None
 
 
-def process_chunk(conn, client, event_rows: list[dict]) -> None:
-    """event_rows: filas de fetch_events_needing_analysis()."""
+def _conexion_viva(conn) -> bool:
+    """Comprueba con una consulta real si la conexión sigue usable.
+
+    No basta con mirar conn.closed: psycopg no se entera de que el otro
+    extremo cortó hasta que se intenta usar la conexión. Un SELECT 1 fuerza
+    esa comprobación sin efectos secundarios.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def process_chunk(conn, client, event_rows: list[dict]):
+    """event_rows: filas de fetch_events_needing_analysis().
+
+    Devuelve la conexión a usar de aquí en adelante — la misma que se pasó,
+    salvo que haya hecho falta reconectar (ver más abajo). El caller tiene
+    que quedarse con lo que devuelve esta función, no seguir usando la
+    conexión original a ciegas.
+    """
     cache_hits: dict[int, dict] = {}
     needs_llm: list[dict] = []
     for ev in event_rows:
@@ -139,6 +160,29 @@ def process_chunk(conn, client, event_rows: list[dict]) -> None:
         bull_bear_results, bb_batch_id = run_batch_and_collect(client, build_bull_bear_batch(contexts))
         judge_results, judge_batch_id = run_batch_and_collect(client, build_judge_batch(contexts, bull_bear_results))
 
+        # BUG REAL (2026-09-15, run 34964242549): cada run_batch_and_collect
+        # espera a la Batch API con un `while ... time.sleep(30)` que puede
+        # durar minutos — este chunk en concreto tardó los DOS batches juntos
+        # unos 20 minutos. Durante toda esa espera `conn` no hace NADA, y
+        # Postgres (Neon, gestionado, agresivo cerrando conexiones ociosas)
+        # la corta por su cuenta. El síntoma no fue en el batch: fue en el
+        # primer INSERT de la vuelta de escritura, con
+        # "psycopg.OperationalError: the connection is lost" — y encima el
+        # `except` que debía capturarlo y seguir con el siguiente evento
+        # (ver más abajo) tampoco podía hacer el rollback, porque la
+        # conexión rota no admite ni eso: se llevaba por delante el chunk
+        # entero, con el resto de eventos ya analizados por la IA y sin
+        # forma de guardarlos.
+        #
+        # Se reconecta aquí, justo después de la espera larga y antes de
+        # escribir nada, en vez de esperar a que un INSERT falle: así el
+        # trabajo caro (la llamada a la IA, ya hecha) no se tira.
+        if not _conexion_viva(conn):
+            logger.warning("La conexión a la base de datos se perdió durante la espera del batch — reconectando")
+            from pipeline.db.connection import get_connection
+
+            conn = get_connection()
+
     for ev in event_rows:
         try:
             _process_single_event(conn, ev, cache_hits.get(ev["event_id"]), bull_bear_results, judge_results, bb_batch_id, judge_batch_id)
@@ -149,7 +193,21 @@ def process_chunk(conn, client, event_rows: list[dict]) -> None:
             # los eventos siguientes fallan con "current transaction is
             # aborted". Pasó exactamente así en la ingesta de fundamentales
             # (run 34943861450): un error real y 134 copias de su consecuencia.
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                # La conexión puede haber muerto DESPUÉS de la comprobación de
+                # arriba (a mitad de este bucle, no solo durante la espera del
+                # batch) — un rollback sobre una conexión rota vuelve a
+                # lanzar, y eso es justo lo que tumbó el run 34964242549:
+                # el rollback de recuperación reventaba sin capturar y se
+                # llevaba por delante los eventos que quedaban por escribir.
+                logger.warning("La conexión también murió al hacer rollback — reconectando para el resto del chunk")
+                from pipeline.db.connection import get_connection
+
+                conn = get_connection()
+
+    return conn
 
 
 def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_results: dict, judge_results: dict, bb_batch_id: str | None, judge_batch_id: str | None) -> None:
@@ -287,21 +345,25 @@ def _store_event_analysis(conn, event_id, novelty, bull_output, bear_output, jud
     conn.commit()
 
 
-def run_pipeline(conn, client, max_chunks: int | None = None) -> int:
+def run_pipeline(conn, client, max_chunks: int | None = None) -> tuple[int, object]:
     """Bucle principal: procesa hasta que no queden eventos pendientes.
-    Devuelve el nº total de eventos procesados (con éxito o con error
-    individual — un fallo por evento no cuenta como "no procesado" a efectos
-    del bucle, ya que _process_single_event ya lo atrapó y logueó)."""
+
+    Devuelve (nº total de eventos procesados, la conexión vigente). Esta
+    última puede NO ser la que se pasó como argumento: process_chunk
+    reconecta si la espera de la Batch API deja la conexión muerta (ver su
+    docstring), y ese cambio tiene que propagarse — el caller no puede
+    seguir usando la conexión original a ciegas después de llamar a esto.
+    """
     total = 0
     chunks_done = 0
     while max_chunks is None or chunks_done < max_chunks:
         batch = fetch_events_needing_analysis(conn, CHUNK_SIZE)
         if not batch:
             break
-        process_chunk(conn, client, batch)
+        conn = process_chunk(conn, client, batch)
         total += len(batch)
         chunks_done += 1
-    return total
+    return total, conn
 
 
 def compute_day3_stats(conn) -> dict:
@@ -374,7 +436,7 @@ if __name__ == "__main__":
     # argumentos lee la variable de entorno tal cual, no la ya limpiada.
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-    processed = run_pipeline(conn, client)
+    processed, conn = run_pipeline(conn, client)
     print(f"Procesados {processed} eventos")
 
     stats = compute_day3_stats(conn)
