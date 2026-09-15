@@ -22,6 +22,23 @@ HEADERS = {"User-Agent": config.EDGAR_USER_AGENT, "Accept-Encoding": "gzip, defl
 _RATE_LIMIT_DELAY = 1.0 / config.EDGAR_RATE_LIMIT_PER_SEC
 
 
+class PermanentHTTPError(RuntimeError):
+    """4xx que no tiene sentido reintentar (404, 403...).
+
+    Se separa de los fallos transitorios porque reintentar un error permanente
+    no solo no arregla nada: lo ESCONDE. Con una URL mal construida, cada
+    filing costaba 30 segundos de esperas (2+4+8+16) antes de rendirse, así que
+    un fallo que debería saltar a la vista en un segundo convertía la ingesta de
+    un día en un proceso de más de media hora que parecía estar trabajando.
+    """
+
+
+def _es_permanente(status: int) -> bool:
+    # 429 (rate limit) es 4xx pero SÍ es transitorio: es justo lo que hay que
+    # reintentar. 408 (timeout) igual.
+    return 400 <= status < 500 and status not in (408, 429)
+
+
 def throttled_get(url: str, **kwargs) -> requests.Response:
     """GET con rate limit fijo y reintentos con backoff exponencial.
 
@@ -40,6 +57,8 @@ def throttled_get(url: str, **kwargs) -> requests.Response:
             if resp.status_code == 429:
                 logger.warning("429 de EDGAR en %s, reintentando", url)
                 continue
+            if _es_permanente(resp.status_code):
+                raise PermanentHTTPError(f"{resp.status_code} en {url} — no se reintenta")
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:  # noqa: PERF203
@@ -82,6 +101,8 @@ def throttled_get_header(url: str) -> str:
                 if resp.status_code == 429:
                     logger.warning("429 de EDGAR en %s, reintentando", url)
                     continue
+                if _es_permanente(resp.status_code):
+                    raise PermanentHTTPError(f"{resp.status_code} en {url} — no se reintenta")
                 resp.raise_for_status()
                 chunks: list[str] = []
                 total = 0

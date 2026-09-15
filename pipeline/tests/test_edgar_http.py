@@ -9,6 +9,7 @@ Bajarlo entero hacía que un día de backfill tardara más de media hora.
 from __future__ import annotations
 
 import pytest
+import requests
 
 from pipeline.ingest import edgar_http
 
@@ -30,8 +31,11 @@ class _FakeStreamResponse:
         return False
 
     def raise_for_status(self):
+        # requests lanza HTTPError, que ES una RequestException y por tanto
+        # entra en el bucle de reintentos. Imitarlo con otra excepción haría
+        # que el test probara un comportamiento que no existe.
         if self.status_code >= 400:
-            raise AssertionError(f"status {self.status_code}")
+            raise requests.HTTPError(f"status {self.status_code}")
 
     def iter_content(self, chunk_size=8192, decode_unicode=False):
         step = self._chunk_size_out
@@ -142,4 +146,61 @@ def test_falla_ruidosamente_si_no_hay_manera(monkeypatch):
     monkeypatch.setattr(edgar_http.requests, "get", _get)
 
     with pytest.raises(RuntimeError, match="No se pudo descargar la cabecera"):
+        edgar_http.throttled_get_header("https://sec.gov/x.txt")
+
+
+# --- No reintentar errores permanentes -------------------------------------
+#
+# Reintentar un 404 no lo arregla: lo DISFRAZA. Con la URL de los filings mal
+# construida, cada documento gastaba 30 segundos de esperas (2+4+8+16) antes de
+# rendirse. Con cientos de filings al día, un fallo que debería cantar al
+# instante convirtió la ingesta en un proceso de 40 minutos que por fuera
+# parecía estar trabajando. El coste del reintento no era el tiempo: era que
+# escondía el síntoma.
+
+
+@pytest.mark.parametrize("status", [404, 403, 400])
+def test_no_reintenta_un_error_permanente(monkeypatch, status):
+    intentos = {"n": 0}
+
+    def _get(*a, **kw):
+        intentos["n"] += 1
+        return _FakeStreamResponse("", status_code=status)
+
+    monkeypatch.setattr(edgar_http.requests, "get", _get)
+
+    with pytest.raises(edgar_http.PermanentHTTPError, match=str(status)):
+        edgar_http.throttled_get("https://sec.gov/edgar/data/1/x.txt")
+
+    assert intentos["n"] == 1  # una y no más
+
+
+@pytest.mark.parametrize("status", [429, 408])
+def test_si_reintenta_los_4xx_que_son_transitorios(monkeypatch, status):
+    """429 (rate limit) y 408 (timeout) son 4xx pero SÍ hay que reintentarlos —
+    son justo los casos para los que existe el backoff."""
+    intentos = {"n": 0}
+
+    def _get(*a, **kw):
+        intentos["n"] += 1
+        if intentos["n"] <= 2:
+            return _FakeStreamResponse("", status_code=status)
+        return _FakeStreamResponse(_fake_submission("ITEM INFORMATION:\t\t2.02\n", cuerpo_kb=1))
+
+    monkeypatch.setattr(edgar_http.requests, "get", _get)
+
+    texto = edgar_http.throttled_get_header("https://sec.gov/x.txt")
+
+    assert intentos["n"] == 3
+    assert "ITEM INFORMATION:" in texto
+
+
+def test_el_error_permanente_lo_sigue_cazando_el_caller(monkeypatch):
+    """scrape_day captura RuntimeError para saltarse un filing suelto; el nuevo
+    error tiene que seguir cayendo ahí y no reventar la ingesta entera."""
+    monkeypatch.setattr(
+        edgar_http.requests, "get", lambda *a, **kw: _FakeStreamResponse("", status_code=404)
+    )
+
+    with pytest.raises(RuntimeError):
         edgar_http.throttled_get_header("https://sec.gov/x.txt")

@@ -79,6 +79,27 @@ def daily_index_url(day: date) -> str:
     )
 
 
+def archive_url(file_name: str) -> str:
+    """URL absoluta de un documento a partir de la ruta que da el daily-index.
+
+    BUG REAL (2026-09-15): el índice trae rutas RELATIVAS al árbol de archivo
+    ('edgar/data/320193/0000320193-26-000123.txt'), y ese árbol cuelga de
+    /Archives/. El código pegaba la ruta directamente al dominio, produciendo
+    https://www.sec.gov/edgar/data/... — un 404 en TODOS y cada uno de los
+    filings. Lo mismo valía para source_url, la dirección que se guarda en la
+    base de datos y con la que después se descarga el texto del filing y se
+    enlaza desde la interfaz: todos rotos.
+
+    Curiosamente daily_index_url sí ponía /Archives/ (justo encima); la
+    diferencia entre las dos funciones no se notaba porque el fallo no rompía
+    nada de forma visible, solo hacía que no se ingestara ni un evento.
+    """
+    path = file_name.lstrip("/")
+    if not path.startswith("Archives/"):
+        path = f"Archives/{path}"
+    return f"{config.EDGAR_BASE}/{path}"
+
+
 # Una fila de datos del daily-index, reconocida por su ESTRUCTURA y no por la
 # posición de sus columnas: tipo de formulario, nombre de empresa, CIK
 # (dígitos), fecha ISO y ruta del fichero, separados por 2+ espacios.
@@ -202,8 +223,7 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str], str]:
     ITEM_TITLE_TO_NUMBER. Verificar contra 2-3 filings reales antes del
     backfill completo (ver --single-day en el bloque __main__).
     """
-    url = f"{config.EDGAR_BASE}/{file_name}"
-    text = throttled_get_header(url)
+    text = throttled_get_header(archive_url(file_name))
     accession_match = re.search(r"ACCESSION NUMBER:\s*(\S+)", text)
     accession = accession_match.group(1) if accession_match else file_name
 
@@ -266,12 +286,14 @@ def scrape_day(day: date) -> list[RawFiling]:
     # sobrevivían hasta la base de datos. Con el parser del índice arreglado
     # aparecieron cientos de filings al día y aun así no llegaba ninguno —
     # imposible de localizar sin saber en cuál de los dos filtros caían.
-    sin_items, sin_clase = 0, 0
+    sin_items, sin_clase, no_descargados = 0, 0, 0
     for row in rows:
         try:
             accession, item_codes, header_text = fetch_filing_item_codes(row["file_name"])
         except RuntimeError as exc:
-            logger.error("Saltando %s: %s", row["file_name"], exc)
+            no_descargados += 1
+            if no_descargados <= 3:
+                logger.error("Saltando %s: %s", row["file_name"], exc)
             continue
         if not item_codes:
             sin_items += 1
@@ -307,23 +329,34 @@ def scrape_day(day: date) -> list[RawFiling]:
                 form_type=row["form_type"],
                 filed_at=filed_at,
                 item_codes=item_codes,
-                source_url=f"{config.EDGAR_BASE}/{row['file_name']}",
+                source_url=archive_url(row["file_name"]),
                 raw_text_hash=raw_hash,
             )
         )
 
-    if rows and not filings:
+    if no_descargados == len(rows) and rows:
+        # NINGÚN filing se pudo descargar: eso no son documentos retirados ni
+        # una racha de mala suerte, es la URL mal construida o EDGAR
+        # rechazando al cliente. Es lo que pasó el 2026-09-15 (faltaba
+        # /Archives/ en la ruta) y hay que distinguirlo del caso de abajo.
+        logger.warning(
+            "%s: no se pudo descargar NINGUNO de los %d formularios 8-K — "
+            "¿es correcta la URL que construye archive_url()?",
+            day.isoformat(), len(rows),
+        )
+    elif rows and not filings:
         # Todos los 8-K del día descargados y ninguno sobrevive: eso no es
         # "scope", es un parser roto. Que se vea en el log como lo que es.
         logger.warning(
             "%s: %d formularios 8-K descargados y NINGUNO utilizable "
-            "(%d sin Items extraídos, %d sin clase de evento relevante)",
-            day.isoformat(), len(rows), sin_items, sin_clase,
+            "(%d sin Items extraídos, %d sin clase de evento relevante, %d no descargados)",
+            day.isoformat(), len(rows), sin_items, sin_clase, no_descargados,
         )
     else:
         logger.info(
-            "%s: %d de %d formularios utilizables (%d sin Items, %d sin clase relevante)",
-            day.isoformat(), len(filings), len(rows), sin_items, sin_clase,
+            "%s: %d de %d formularios utilizables "
+            "(%d sin Items, %d sin clase relevante, %d no descargados)",
+            day.isoformat(), len(filings), len(rows), sin_items, sin_clase, no_descargados,
         )
     return filings
 

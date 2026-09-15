@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 
 from pipeline.ingest.edgar_scraper import (
+    archive_url,
     classify_event_classes,
     compute_d0_close_date,
+    daily_index_url,
     parse_daily_index,
 )
 
@@ -145,6 +147,45 @@ def test_parse_daily_index_no_confunde_nombres_con_espacios():
     rows = parse_daily_index(raw)
     epsilon = next(r for r in rows if r["cik"] == "3334445")
     assert epsilon["company_name"] == "EPSILON ENERGY PARTNERS LP"
+
+
+def test_archive_url_mete_el_documento_bajo_archives():
+    """BUG REAL (2026-09-15): las rutas del daily-index son relativas al árbol
+    de archivo, que cuelga de /Archives/. Pegarlas al dominio a secas daba
+    https://www.sec.gov/edgar/data/... — 404 en TODOS los filings, ni uno se
+    llegó a descargar."""
+    url = archive_url("edgar/data/1234567/0001234567-26-000123.txt")
+    assert url == "https://www.sec.gov/Archives/edgar/data/1234567/0001234567-26-000123.txt"
+
+
+def test_archive_url_no_duplica_archives_si_ya_viene_en_la_ruta():
+    ya_absoluta = "Archives/edgar/data/1234567/0001234567-26-000123.txt"
+    assert archive_url(ya_absoluta).count("Archives") == 1
+
+
+def test_archive_url_tolera_la_barra_inicial():
+    assert archive_url("/edgar/data/1/x.txt") == archive_url("edgar/data/1/x.txt")
+
+
+def test_el_indice_y_los_documentos_cuelgan_del_mismo_arbol():
+    """El invariante que se rompió: daily_index_url SÍ ponía /Archives/ y
+    archive_url no. Las dos funciones apuntan al mismo árbol de EDGAR, así que
+    o las dos lo llevan o ninguna — que discreparan fue justo el fallo."""
+    indice = daily_index_url(date(2026, 9, 10))
+    documento = archive_url("edgar/data/1234567/0001234567-26-000123.txt")
+    assert indice.startswith("https://www.sec.gov/Archives/")
+    assert documento.startswith("https://www.sec.gov/Archives/")
+
+
+def test_source_url_guardado_apunta_a_un_documento_descargable():
+    """source_url no es decorativo: se guarda en la base de datos, filing_text.py
+    lo usa después para bajar el texto del filing, y la interfaz lo enlaza. Si
+    sale mal formado, el fallo aparece tres pasos más adelante."""
+    raw = (FIXTURES / "sample_daily_index_real.idx").read_text()
+    for row in parse_daily_index(raw):
+        url = archive_url(row["file_name"])
+        assert url.startswith("https://www.sec.gov/Archives/edgar/data/")
+        assert url.endswith(".txt")
 
 
 def test_item_extraction_numeric_format():
