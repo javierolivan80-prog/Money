@@ -143,6 +143,12 @@ def process_chunk(conn, client, event_rows: list[dict]) -> None:
             _process_single_event(conn, ev, cache_hits.get(ev["event_id"]), bull_bear_results, judge_results, bb_batch_id, judge_batch_id)
         except Exception:
             logger.exception("Fallo analizando evento %d — se continúa con el siguiente", ev["event_id"])
+            # Sin rollback, "se continúa con el siguiente" es mentira cuando el
+            # fallo viene de Postgres: la transacción queda abortada y TODOS
+            # los eventos siguientes fallan con "current transaction is
+            # aborted". Pasó exactamente así en la ingesta de fundamentales
+            # (run 34943861450): un error real y 134 copias de su consecuencia.
+            conn.rollback()
 
 
 def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_results: dict, judge_results: dict, bb_batch_id: str | None, judge_batch_id: str | None) -> None:

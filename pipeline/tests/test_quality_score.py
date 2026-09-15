@@ -186,3 +186,51 @@ def test_as_json_es_serializable_y_conserva_explicaciones():
     json.dumps(payload)  # no debe lanzar
     assert len(payload["components"]) == 5
     assert all(c["explanation"] for c in payload["components"])
+
+
+# --- Decimal de Postgres ----------------------------------------------------
+
+
+def test_las_columnas_numeric_llegan_como_float_y_no_como_decimal():
+    """BUG REAL (run 34943861450): Postgres devuelve NUMERIC como
+    decimal.Decimal y este módulo está escrito para float. La mezcla revienta:
+
+        TypeError: unsupported operand type(s) for ** or pow():
+                   'decimal.Decimal' and 'float'
+
+    en (last / first) ** (1 / years). Se convierte en la frontera de lectura,
+    no en cada operación."""
+    from decimal import Decimal
+
+    from pipeline.analyze.quality_score import _a_float
+
+    fila = _a_float({"revenue": Decimal("1000.50"), "cik": "123", "filed_at": None})
+    assert isinstance(fila["revenue"], float)
+    assert fila["revenue"] == 1000.50
+    assert fila["cik"] == "123"      # lo que no es Decimal no se toca
+    assert fila["filed_at"] is None
+
+
+def test_el_calculo_de_crecimiento_aguanta_valores_de_postgres():
+    """El caso exacto que petó: cuatro ejercicios de ingresos leídos de la base
+    de datos como Decimal."""
+    from decimal import Decimal
+
+    from pipeline.analyze.quality_score import _a_float, _score_crecimiento
+
+    filas = [_a_float({"revenue": Decimal(v)}) for v in ("1000", "1100", "1210", "1331")]
+    componente = _score_crecimiento([f["revenue"] for f in filas])
+    assert componente.score is not None
+    assert componente.raw_value == pytest.approx(0.10, abs=0.001)  # 10% anual
+
+
+def test_calidad_del_beneficio_aguanta_un_capex_ausente():
+    """Otro sitio donde la mezcla habría petado más adelante:
+    `operating_cash_flow - 0.0` con un Decimal a la izquierda."""
+    from decimal import Decimal
+
+    from pipeline.analyze.quality_score import _a_float, _score_calidad_beneficio
+
+    fila = _a_float({"operating_cash_flow": Decimal("150"), "net_income": Decimal("100")})
+    componente = _score_calidad_beneficio(fila["operating_cash_flow"], None, fila["net_income"])
+    assert componente.score is not None
