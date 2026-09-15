@@ -44,22 +44,18 @@ BACKOFF_BASE_S = 2         # 2, 4, 8, 16 — misma política que el resto del pr
 
 
 def _trading_days_expected(start: date, end: date) -> set[date]:
-    """Aproximación de días hábiles de mercado (lunes-viernes, sin festivos).
+    """Días en los que la bolsa abre de verdad, festivos incluidos.
 
-    Es deliberadamente conservadora: no conocer los festivos de NYSE exactos
-    generará algún falso positivo de 'gap' en días festivos reales. Esto es
-    aceptable porque el flag es una SEÑAL DE ALERTA, no una verdad absoluta —
-    el objetivo es no dejar pasar en silencio un hueco real de deslistado.
-    Fase 2 (Norgate/Sharadar, ver DATA_REQUIREMENTS_PHASED.md) trae calendario
-    de festivos correcto.
+    ANTES era lunes-viernes a secas, con un comentario que daba los falsos
+    positivos por "aceptables porque el flag es una SEÑAL DE ALERTA". No lo
+    eran: en el primer run con precios reales marcó 14 huecos en CASI LOS 150
+    tickers, 3M y Adobe entre ellos, y los 14 eran exactamente los festivos del
+    rango. Una alerta que salta en todos los casos a la vez no avisa de nada —
+    tapaba justo lo que tenía que detectar.
     """
-    days = set()
-    d = start
-    while d <= end:
-        if d.weekday() < 5:
-            days.add(d)
-        d += timedelta(days=1)
-    return days
+    from pipeline.ingest.market_calendar import dias_de_negociacion
+
+    return dias_de_negociacion(start, end)
 
 
 COLUMNAS_REQUERIDAS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
