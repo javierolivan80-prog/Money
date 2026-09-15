@@ -190,15 +190,66 @@ def parse_daily_index(raw_text: str) -> list[dict]:
 # por regulación — a diferencia del formato exacto de la cabecera SGML, esto no
 # cambia). Se usan como fallback si la cabecera imprime el título en vez del
 # número: ver advertencia en fetch_filing_item_codes.
+#
+# CONFIRMADO EN PRODUCCIÓN (2026-09-15, run 34939563551): EDGAR imprime el
+# TÍTULO, no el número. La cabecera real dice:
+#
+#     ITEM INFORMATION:		Regulation FD Disclosure
+#
+# y nunca "7.01". Así que esto no es el fallback: es la vía principal.
+#
+# POR QUÉ ESTÁN TODOS Y NO SOLO LOS 8 QUE INTERESAN: la lista tenía únicamente
+# los Items dentro del alcance, así que un 8-K cuyos Items caían todos fuera
+# (un 'Regulation FD Disclosure', por ejemplo) no producía NINGÚN código y se
+# contaba como "sin Items extraídos" — la señal de que el formato de la
+# cabecera no se entiende. El log decía "55 sin Items, 0 sin clase relevante"
+# cuando la verdad era justo la contraria: se entendían perfectamente y
+# quedaban fuera de alcance a propósito. Con la lista completa, "sin Items"
+# vuelve a significar solo una cosa: que hay que ir a mirar el formato.
+#
+# Las claves son FRAGMENTOS distintivos del título oficial, no el título
+# entero, para no depender de la puntuación (apóstrofos, puntos y comas) que
+# varía entre filings.
 ITEM_TITLE_TO_NUMBER = {
+    # Sección 1 — negocio y operaciones
     "entry into a material definitive agreement": "1.01",
+    "termination of a material definitive agreement": "1.02",
+    "bankruptcy or receivership": "1.03",
+    "mine safety": "1.04",
+    "material cybersecurity incident": "1.05",
+    # Sección 2 — información financiera
     "completion of acquisition or disposition of assets": "2.01",
     "results of operations and financial condition": "2.02",
-    "bankruptcy or receivership": "1.03",
-    "changes in registrant's certifying accountant": "4.01",
+    "creation of a direct financial obligation": "2.03",
+    "triggering events that accelerate": "2.04",
+    "costs associated with exit or disposal": "2.05",
+    "material impairment": "2.06",
+    # Sección 3 — valores y mercados
+    "notice of delisting": "3.01",
+    "unregistered sales of equity securities": "3.02",
+    "material modification to rights of security holders": "3.03",
+    # Sección 4 — auditores y estados financieros
+    "certifying accountant": "4.01",
     "non-reliance on previously issued financial statements": "4.02",
+    # Sección 5 — gobierno corporativo
+    "changes in control of registrant": "5.01",
     "departure of directors or certain officers": "5.02",
+    "amendments to articles of incorporation": "5.03",
+    "temporary suspension of trading": "5.04",
+    "code of ethics": "5.05",
+    "change in shell company status": "5.06",
+    "submission of matters to a vote of security holders": "5.07",
+    "shareholder director nominations": "5.08",
+    # Sección 6 — titulizaciones
+    "abs informational and computational material": "6.01",
+    "change of servicer or trustee": "6.02",
+    "change in credit enhancement": "6.03",
+    "failure to make a required distribution": "6.04",
+    "securities act updating disclosure": "6.05",
+    # Secciones 7-9
+    "regulation fd disclosure": "7.01",
     "other events": "8.01",
+    "financial statements and exhibits": "9.01",
 }
 
 
@@ -235,10 +286,13 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str], str]:
             items.append(numeric.group(1))
             continue
         title_key = line.lower().rstrip(".")
-        for title, number in ITEM_TITLE_TO_NUMBER.items():
-            if title in title_key:
-                items.append(number)
-                break
+        # Se queda con la coincidencia MÁS LARGA, no con la primera: parar en
+        # la primera hacía que el resultado dependiera del orden del
+        # diccionario, y basta con que un fragmento corto aparezca dentro de un
+        # título más largo para clasificar mal el Item.
+        coincidencias = [(t, n) for t, n in ITEM_TITLE_TO_NUMBER.items() if t in title_key]
+        if coincidencias:
+            items.append(max(coincidencias, key=lambda par: len(par[0]))[1])
     return accession, items, text
 
 

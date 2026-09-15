@@ -62,6 +62,52 @@ def _trading_days_expected(start: date, end: date) -> set[date]:
     return days
 
 
+COLUMNAS_REQUERIDAS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
+
+
+def aplanar_columnas(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Deja las columnas en un solo nivel ('Close', 'Open'...).
+
+    BUG REAL (2026-09-15): yfinance devuelve las columnas como MultiIndex
+    (campo, ticker) TAMBIÉN cuando se pide un único ticker. Con eso,
+    row['Close'] no da un número sino una Series de un elemento, y
+    float(...) revienta con:
+
+        TypeError: float() argument must be a string or a real number,
+                   not 'Series'
+
+    Se quita el nivel que contiene el ticker, esté donde esté, en vez de
+    asumir que es el último: si yfinance cambia el orden de los niveles, el
+    aplanado sigue siendo correcto.
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    for nivel in range(df.columns.nlevels):
+        if set(df.columns.get_level_values(nivel)) <= {ticker}:
+            return df.droplevel(nivel, axis=1)
+    # Ningún nivel es solo el ticker (no debería pasar pidiendo uno solo). Se
+    # cae al comportamiento por defecto de yfinance, que lo pone el último.
+    return df.droplevel(-1, axis=1)
+
+
+def _validar_columnas(df: pd.DataFrame, ticker: str) -> None:
+    """Falla en voz alta si falta una columna o si alguna está duplicada.
+
+    Una columna duplicada hace que row['Close'] vuelva a ser una Series, que
+    es exactamente el fallo que se acaba de arreglar: sin esta comprobación
+    reaparecería como el mismo TypeError críptico a mitad de la descarga, en
+    vez de decir qué columnas trae el DataFrame de verdad.
+    """
+    faltan = [c for c in COLUMNAS_REQUERIDAS if c not in df.columns]
+    duplicadas = [c for c in COLUMNAS_REQUERIDAS if list(df.columns).count(c) > 1]
+    if faltan or duplicadas:
+        raise ValueError(
+            f"Columnas inesperadas en los precios de {ticker} "
+            f"(faltan: {faltan or 'ninguna'}; duplicadas: {duplicadas or 'ninguna'}). "
+            f"Columnas recibidas: {list(df.columns)}. ¿Cambió el formato de yfinance?"
+        )
+
+
 def _download_one_with_retry(ticker: str, start: date, end: date) -> pd.DataFrame | None:
     import yfinance as yf
 
@@ -75,7 +121,7 @@ def _download_one_with_retry(ticker: str, start: date, end: date) -> pd.DataFram
                 progress=False,
                 threads=False,
             )
-            return df
+            return aplanar_columnas(df, ticker) if df is not None else None
         except Exception as exc:  # yfinance no tiene una jerarquía de excepciones propia estable
             delay = BACKOFF_BASE_S * (2**attempt)
             logger.warning("Fallo descargando %s (intento %d): %s — esperando %ds", ticker, attempt, exc, delay)
@@ -121,6 +167,8 @@ def _flag_full_gap(conn, ticker: str, start: date, end: date) -> None:
 
 
 def _store_with_gap_detection(conn, ticker: str, df: pd.DataFrame, expected_days: set[date]) -> None:
+    df = aplanar_columnas(df, ticker)  # idempotente: no-op si ya viene plano
+    _validar_columnas(df, ticker)
     present_days = {d.date() for d in df.index}
     with conn.cursor() as cur:
         for idx, row in df.iterrows():

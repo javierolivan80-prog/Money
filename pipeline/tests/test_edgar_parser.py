@@ -199,22 +199,112 @@ def test_item_extraction_numeric_format():
 
 
 def test_item_extraction_titled_format():
-    """Cabecera con el Item impreso como título en texto libre.
+    """Cabecera con el Item impreso como título en texto libre. Este es el
+    formato que EDGAR usa DE VERDAD (confirmado sobre la cabecera real), no el
+    numérico.
 
-    Esta es la rama de fallback que existe precisamente porque no se pudo
-    verificar en vivo cuál de los dos formatos usa EDGAR realmente.
+    Devuelve 2.02 y 9.01, lo mismo que test_item_extraction_numeric_format
+    sobre la misma cabecera en formato numérico: los dos formatos tienen que
+    dar el mismo resultado. Antes salía solo 2.02 porque 9.01 no estaba en el
+    mapa y se perdía por el camino; descartar 9.01 es trabajo de
+    classify_event_classes, no del extractor.
     """
+    text = (FIXTURES / "sample_8k_header_titled.txt").read_text()
+    assert _items_de_cabecera(text) == ["2.02", "9.01"]
+
+
+def test_los_dos_formatos_de_cabecera_dan_el_mismo_resultado():
+    """El invariante: dé EDGAR el número o el título, el pipeline tiene que ver
+    los mismos Items."""
+    numerico = (FIXTURES / "sample_8k_header_numeric.txt").read_text()
+    titulado = (FIXTURES / "sample_8k_header_titled.txt").read_text()
+    assert _items_de_cabecera(numerico) == _items_de_cabecera(titulado)
+
+
+def _items_de_cabecera(texto: str) -> list[str]:
+    """Mismo extractor que fetch_filing_item_codes, sobre un texto dado."""
     from pipeline.ingest.edgar_scraper import ITEM_TITLE_TO_NUMBER
 
-    text = (FIXTURES / "sample_8k_header_titled.txt").read_text()
-    lines = re.findall(r"ITEM INFORMATION:\s*(.+)", text)
-    found = []
-    for line in lines:
-        key = line.strip().lower().rstrip(".")
-        for title, number in ITEM_TITLE_TO_NUMBER.items():
-            if title in key:
-                found.append(number)
-    assert found == ["2.02"]
+    encontrados = []
+    for linea in re.findall(r"ITEM INFORMATION:\s*(.+)", texto):
+        linea = linea.strip()
+        numerico = re.match(r"^(\d\.\d\d)\b", linea)
+        if numerico:
+            encontrados.append(numerico.group(1))
+            continue
+        clave = linea.lower().rstrip(".")
+        coincidencias = [(t, n) for t, n in ITEM_TITLE_TO_NUMBER.items() if t in clave]
+        if coincidencias:
+            encontrados.append(max(coincidencias, key=lambda par: len(par[0]))[1])
+    return encontrados
+
+
+@pytest.mark.parametrize(
+    "titulo,esperado",
+    [
+        # Los tres títulos EXACTOS que volcó el run 34939563551 y que el mapa
+        # anterior no reconocía. Copiados literalmente del log, no inventados.
+        ("Notice of Delisting or Failure to Satisfy a Continued Listing Rule or Standard; Transfer of Listing", "3.01"),
+        ("Regulation FD Disclosure", "7.01"),
+        ("Financial Statements and Exhibits", "9.01"),
+    ],
+)
+def test_titulos_reales_que_edgar_imprimio_y_no_se_reconocian(titulo, esperado):
+    """EDGAR imprime el TÍTULO del Item, nunca el número — confirmado sobre la
+    cabecera real. El mapa solo tenía los 8 Items dentro de alcance, así que un
+    8-K cuyos Items caían todos fuera no daba NINGÚN código y se contaba como
+    'formato desconocido' en vez de 'fuera de alcance'."""
+    assert _items_de_cabecera(f"ITEM INFORMATION:\t\t{titulo}") == [esperado]
+
+
+def test_un_item_fuera_de_alcance_se_reconoce_pero_no_genera_evento():
+    """La distinción que se había perdido: reconocer el Item y decidir que no
+    interesa son dos cosas distintas. Regulation FD se entiende perfectamente;
+    simplemente está fuera del alcance del sistema."""
+    items = _items_de_cabecera("ITEM INFORMATION:\t\tRegulation FD Disclosure")
+    assert items == ["7.01"]           # se reconoce
+    assert classify_event_classes(items) == []  # y aun así no genera evento
+
+
+def test_todos_los_items_del_mapa_tienen_numero_valido():
+    from pipeline.ingest.edgar_scraper import ITEM_TITLE_TO_NUMBER
+
+    for titulo, numero in ITEM_TITLE_TO_NUMBER.items():
+        assert re.fullmatch(r"\d\.\d\d", numero), f"{titulo} -> {numero}"
+    # Sin números repetidos: dos títulos distintos no pueden ser el mismo Item.
+    numeros = list(ITEM_TITLE_TO_NUMBER.values())
+    assert len(numeros) == len(set(numeros))
+
+
+def test_ningun_fragmento_del_mapa_es_substring_de_otro():
+    """Los fragmentos se buscan por substring. Si uno estuviera contenido en
+    otro, un Item podría clasificarse como el que no es. Se resuelve por la
+    coincidencia más larga, pero conviene que ni siquiera se dé el caso."""
+    from pipeline.ingest.edgar_scraper import ITEM_TITLE_TO_NUMBER
+
+    fragmentos = list(ITEM_TITLE_TO_NUMBER)
+    solapados = [(a, b) for a in fragmentos for b in fragmentos if a != b and a in b]
+    assert solapados == []
+
+
+def test_la_coincidencia_mas_larga_gana_y_no_el_orden_del_diccionario():
+    """Con un título que contiene dos fragmentos, debe ganar el más específico
+    —no el que salga antes al recorrer el diccionario."""
+    from pipeline.ingest import edgar_scraper
+
+    mapa = {"other events": "8.01", "other events of importance": "9.99"}
+    original = edgar_scraper.ITEM_TITLE_TO_NUMBER
+    try:
+        edgar_scraper.ITEM_TITLE_TO_NUMBER = mapa
+        assert _items_de_cabecera("ITEM INFORMATION:\t\tOther Events of Importance") == ["9.99"]
+    finally:
+        edgar_scraper.ITEM_TITLE_TO_NUMBER = original
+
+
+def test_el_numero_gana_al_titulo_si_la_cabecera_trae_los_dos_formatos():
+    """Si algún día EDGAR volviera a imprimir números, la rama numérica sigue
+    siendo la primera: es más específica que buscar fragmentos de texto."""
+    assert _items_de_cabecera("ITEM INFORMATION:\t\t2.02 Results of Operations") == ["2.02"]
 
 
 def test_classify_event_classes_dedupes_and_ignores_irrelevant_items():
