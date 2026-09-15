@@ -101,9 +101,19 @@ _ROW_RE = re.compile(
     r"^(?P<form_type>\S.*?)\s{2,}"        # tipo de formulario
     r"(?P<company_name>\S.*?)\s{2,}"      # nombre (puede contener espacios simples)
     r"(?P<cik>\d{1,10})\s+"               # CIK
-    r"(?P<date_filed>\d{4}-\d{2}-\d{2})\s+"  # fecha de presentación
+    # FECHA: el fichero REAL de EDGAR la trae COMPACTA (20260910), no en ISO.
+    # Esto es lo único que fallaba del parseo, y costó dos intentos a ciegas
+    # descubrirlo: el fixture inventado usaba guiones. Se acepta también el
+    # formato con guiones por tolerancia, pero el real es el de 8 dígitos.
+    r"(?P<date_filed>\d{8}|\d{4}-\d{2}-\d{2})\s+"
     r"(?P<file_name>\S+)\s*$"             # ruta del documento
 )
+
+
+def _normalize_filed_date(raw: str) -> str:
+    """A ISO (YYYY-MM-DD), que es lo que espera el resto del pipeline
+    (scrape_day hace strptime con '%Y-%m-%d')."""
+    return raw if "-" in raw else f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
 
 
 def parse_daily_index(raw_text: str) -> list[dict]:
@@ -133,7 +143,7 @@ def parse_daily_index(raw_text: str) -> list[dict]:
                 "form_type": match.group("form_type"),
                 "company_name": match.group("company_name").strip(),
                 "cik": match.group("cik").lstrip("0") or "0",
-                "date_filed": match.group("date_filed"),
+                "date_filed": _normalize_filed_date(match.group("date_filed")),
                 "file_name": match.group("file_name"),
             }
         )

@@ -39,6 +39,55 @@ def test_parse_daily_index_extracts_correct_fields():
     assert acme["file_name"] == "edgar/data/1234567/0001234567-24-000123.txt"
 
 
+def test_parse_daily_index_contra_el_formato_real_de_edgar():
+    """EL formato de verdad, capturado del propio servidor de la SEC el
+    2026-09-10 (run 34886811117, volcado en el mensaje del ValueError).
+
+    Este fichero es la razón de ser del resto de tests de este bloque: los dos
+    parsers anteriores se escribieron contra fixtures INVENTADOS porque desde
+    el entorno de desarrollo no hay salida hacia sec.gov, y ambos fallaron en
+    producción devolviendo 0 eventos. Lo que ninguna suposición acertó:
+
+      - La fecha viene COMPACTA ('20260910'), no en ISO ('2026-09-10'). Ese
+        detalle, y solo ese, tumbaba el parseo entero.
+      - El separador es una tira continua de guiones, no tramos por columna.
+      - Entre la cabecera y la tabla hay líneas con espacios en blanco.
+      - Los nombres de empresa llevan comas y puntos ('Glow Holdings, Inc.').
+      - El fichero trae TODOS los tipos de formulario (1-A, 1-A-W, 10-K...),
+        no solo 8-K.
+    """
+    raw = (FIXTURES / "sample_daily_index_real.idx").read_text()
+    rows = parse_daily_index(raw)
+
+    assert {r["form_type"] for r in rows} == {"8-K"}
+    assert len(rows) == 3  # ACME, Beta, EPSILON — ni el 8-K/A, ni el 10-K, ni los 1-A
+
+    acme = next(r for r in rows if "ACME" in r["company_name"])
+    assert acme["cik"] == "1234567"
+    assert acme["date_filed"] == "2026-09-10"  # normalizada a ISO desde 20260910
+    assert acme["file_name"] == "edgar/data/1234567/0001234567-26-000123.txt"
+
+
+def test_parse_daily_index_normaliza_la_fecha_compacta_a_iso():
+    """El resto del pipeline hace strptime('%Y-%m-%d') sobre date_filed
+    (ver scrape_day), así que la fecha compacta del fichero real tiene que
+    salir ya convertida o reventaría un paso más adelante."""
+    from datetime import datetime
+
+    raw = (FIXTURES / "sample_daily_index_real.idx").read_text()
+    for row in parse_daily_index(raw):
+        # No debe lanzar: es exactamente lo que hace scrape_day.
+        datetime.strptime(row["date_filed"], "%Y-%m-%d")
+
+
+def test_parse_daily_index_nombres_con_coma_y_punto():
+    """'Beta Biosciences, Inc.' tiene coma y punto; el corte entre columnas
+    son 2+ espacios, no la puntuación."""
+    raw = (FIXTURES / "sample_daily_index_real.idx").read_text()
+    beta = next(r for r in parse_daily_index(raw) if r["cik"] == "9876543")
+    assert beta["company_name"] == "Beta Biosciences, Inc."
+
+
 def test_parse_daily_index_con_separador_de_guiones_continuo():
     """REGRESIÓN (bug real, 2026-09-14): el parser derivaba el corte de cada
     columna de la línea de guiones, asumiendo tramos separados por columna
