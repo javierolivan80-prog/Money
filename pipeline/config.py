@@ -14,7 +14,17 @@ _db_url = os.environ.get("DATABASE_URL", "postgresql://localhost:5432/money_poc"
 DATABASE_URL = _db_url.strip() if _db_url else ""
 
 # --- Anthropic ---
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # requerido para analyze/*
+_anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+# .strip(): mismo motivo que DATABASE_URL más arriba. Un secreto de GitHub
+# pegado con un salto de línea al final llega aquí intacto, y al mandarlo como
+# cabecera HTTP (Authorization / x-api-key) la librería lo rechaza:
+#   httpx2.LocalProtocolError: Illegal header value b'***\n'
+# Un salto de línea en una cabecera es el vector clásico de inyección de
+# cabeceras HTTP, así que el rechazo es correcto — lo que hay que arreglar es
+# no mandarlo sucio. Sin este strip, el mensaje de "falta ANTHROPIC_API_KEY"
+# de más abajo no salta (la variable SÍ existe), y el fallo real queda
+# enterrado dentro de las tripas del SDK.
+ANTHROPIC_API_KEY = _anthropic_key.strip() if _anthropic_key else None
 CLASSIFIER_MODEL = "claude-haiku-4-5"
 ANALYZER_MODEL = "claude-haiku-4-5"  # Bull/Bear (Etapas 3-4) — "rápido", pedido por el spec
 # Judge (Etapa 5): "mejor reasoning" — el spec de Fase 2 nombra Sonnet 4.6

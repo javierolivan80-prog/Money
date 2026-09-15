@@ -367,7 +367,11 @@ if __name__ == "__main__":
         )
 
     conn = get_connection()
-    client = anthropic.Anthropic()
+    # api_key EXPLÍCITO: ver la nota en adversarial_analyzer.py. Sin esto, el
+    # chequeo de arriba puede pasar (la variable existe) y aun así reventar
+    # más abajo si el secreto trae un salto de línea, porque la librería sin
+    # argumentos lee la variable de entorno tal cual, no la ya limpiada.
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     processed = run_pipeline(conn, client)
     print(f"Procesados {processed} eventos")
