@@ -81,9 +81,22 @@ def aplanar_columnas(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     for nivel in range(df.columns.nlevels):
         if set(df.columns.get_level_values(nivel)) <= {ticker}:
             return df.droplevel(nivel, axis=1)
-    # Ningún nivel es solo el ticker (no debería pasar pidiendo uno solo). Se
-    # cae al comportamiento por defecto de yfinance, que lo pone el último.
-    return df.droplevel(-1, axis=1)
+    return df.droplevel(nivel_de_tickers(df.columns), axis=1)
+
+
+def nivel_de_tickers(columnas: pd.MultiIndex) -> int:
+    """Cuál de los dos niveles lleva los tickers y cuál los campos.
+
+    Se identifica por el CONTENIDO, no por la posición: el nivel de campos es
+    el que trae 'Open', 'Close' y compañía; el otro es el de tickers. Así el
+    código aguanta que yfinance invierta el orden de los niveles, que es
+    justamente el tipo de suposición sobre un formato ajeno que ya ha costado
+    varios fallos en producción en este proyecto.
+    """
+    for nivel in range(columnas.nlevels):
+        if not set(columnas.get_level_values(nivel)) & set(COLUMNAS_REQUERIDAS):
+            return nivel
+    return columnas.nlevels - 1  # por defecto de yfinance, el ticker va el último
 
 
 def _validar_columnas(df: pd.DataFrame, ticker: str) -> None:
@@ -126,6 +139,67 @@ def _download_one_with_retry(ticker: str, start: date, end: date) -> pd.DataFram
     return None
 
 
+def _descargar_lote_con_reintentos(tickers: list[str], start: date, end: date) -> pd.DataFrame | None:
+    """Un lote entero en UNA sola petición.
+
+    POR QUÉ (medido en producción, run 34943861450): descargando de uno en uno,
+    150 tickers tardaron ~60 minutos, a razón de 2,5 por minuto. No es un
+    problema de hoy sino de mañana: el universo crece con cada día ingestado, y
+    a este ritmo la pasada nocturna deja de caber en la noche.
+
+    yf.download acepta una lista y devuelve las columnas como (campo, ticker) —
+    que es, precisamente, POR QUÉ venían en dos niveles y reventaba float():
+    la librería llevaba todo el tiempo preparada para el modo por lotes y se
+    estaba usando de una en una.
+    """
+    import yfinance as yf
+
+    for intento in range(MAX_RETRIES):
+        try:
+            return yf.download(
+                tickers,
+                start=start.isoformat(),
+                end=(end + timedelta(days=1)).isoformat(),
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception as exc:  # yfinance no tiene jerarquía de excepciones estable
+            espera = BACKOFF_BASE_S * (2**intento)
+            logger.warning(
+                "Fallo descargando el lote de %d tickers (intento %d): %s — esperando %ds",
+                len(tickers), intento, exc, espera,
+            )
+            time.sleep(espera)
+    logger.error("El lote de %d tickers falló tras %d intentos", len(tickers), MAX_RETRIES)
+    return None
+
+
+def extraer_ticker_del_lote(df: pd.DataFrame | None, ticker: str) -> pd.DataFrame | None:
+    """Saca de la descarga por lotes el sub-DataFrame de un ticker.
+
+    Devuelve None cuando el lote no trae nada utilizable de ese ticker (no
+    aparece en las columnas, o viene entero a NaN porque está deslistado). El
+    caller lo reintenta entonces de uno en uno: si alguna suposición sobre la
+    forma del lote es errónea, el peor caso es volver al comportamiento
+    anterior —lento pero correcto— en vez de perder precios en silencio.
+    """
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        nivel = nivel_de_tickers(df.columns)
+        if ticker not in set(df.columns.get_level_values(nivel)):
+            return None
+        propio = df.xs(ticker, axis=1, level=nivel)
+    else:
+        # Un lote de un solo ticker puede volver ya plano.
+        propio = df
+
+    propio = propio.dropna(how="all")
+    return propio if not propio.empty else None
+
+
 def backfill_tickers(tickers: list[str], start: date, end: date) -> None:
     from pipeline.db.connection import get_connection
 
@@ -135,13 +209,36 @@ def backfill_tickers(tickers: list[str], start: date, end: date) -> None:
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i : i + BATCH_SIZE]
         logger.info("Lote %d-%d de %d tickers", i, i + len(batch), len(tickers))
+
+        lote = _descargar_lote_con_reintentos(batch, start, end)
+        pendientes = []
         for ticker in batch:
+            df = extraer_ticker_del_lote(lote, ticker)
+            if df is None:
+                pendientes.append(ticker)
+                continue
+            _store_with_gap_detection(conn, ticker, df, expected_days)
+
+        # Red de seguridad: lo que el lote no trajo se reintenta de uno en uno
+        # ANTES de darlo por deslistado. Un ticker ausente del lote puede serlo
+        # por estar deslistado de verdad, pero también porque alguna suposición
+        # sobre la forma del resultado sea errónea — y no se ha podido validar
+        # contra el servidor real desde el entorno de desarrollo. Con esto, el
+        # peor caso de equivocarse es tardar lo que se tardaba antes, no
+        # marcar como deslistadas 150 empresas que cotizan perfectamente.
+        if pendientes:
+            logger.info(
+                "%d de %d tickers del lote no vinieron en la descarga conjunta, "
+                "se piden de uno en uno", len(pendientes), len(batch),
+            )
+        for ticker in pendientes:
             df = _download_one_with_retry(ticker, start, end)
             if df is None or df.empty:
                 logger.warning("Sin datos para %s en absoluto — probable deslistado total", ticker)
                 _flag_full_gap(conn, ticker, start, end)
                 continue
             _store_with_gap_detection(conn, ticker, df, expected_days)
+
         time.sleep(PAUSE_BETWEEN_BATCHES_S)
     logger.info("Backfill de precios completo para %d tickers", len(tickers))
 

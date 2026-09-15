@@ -17,6 +17,8 @@ from pipeline.ingest.yfinance_backfill import (
     COLUMNAS_REQUERIDAS,
     _validar_columnas,
     aplanar_columnas,
+    extraer_ticker_del_lote,
+    nivel_de_tickers,
 )
 
 _FECHAS = pd.to_datetime(["2026-09-09", "2026-09-10"])
@@ -107,3 +109,97 @@ def test_validar_columnas_caza_una_columna_duplicada():
     df = pd.concat([df, df[["Close"]]], axis=1)
     with pytest.raises(ValueError, match="duplicadas"):
         _validar_columnas(df, "AAPL")
+
+
+# --- Descarga por lotes -----------------------------------------------------
+#
+# Medido en producción (run 34943861450): de uno en uno, 150 tickers tardaron
+# ~60 minutos. yf.download acepta una lista — de hecho ESA es la razón de que
+# las columnas vengan en dos niveles. La librería siempre estuvo preparada para
+# el modo por lotes; se estaba usando de una en una.
+
+
+def _df_lote(tickers: list[str], vacios: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Lo que devuelve yf.download con una lista: columnas (campo, ticker).
+    Los tickers en `vacios` vienen enteros a NaN, como los deslistados."""
+    columnas, datos = [], {}
+    for campo, valores in _VALORES.items():
+        for t in tickers:
+            columnas.append((campo, t))
+            datos[(campo, t)] = [float("nan")] * len(valores) if t in vacios else valores
+    df = pd.DataFrame(datos, index=_FECHAS)
+    df.columns = pd.MultiIndex.from_tuples(columnas)
+    return df
+
+
+def test_saca_cada_ticker_del_lote_con_sus_propios_valores():
+    lote = _df_lote(["AAPL", "MSFT"])
+    for t in ("AAPL", "MSFT"):
+        propio = extraer_ticker_del_lote(lote, t)
+        assert list(propio.columns) == list(_VALORES)
+        assert list(propio["Close"]) == _VALORES["Close"]
+
+
+def test_el_sub_dataframe_del_lote_ya_sirve_para_float():
+    """Lo que importa: lo que sale del lote tiene que poder guardarse sin más
+    conversiones — es el mismo punto donde reventó float(row['Close'])."""
+    propio = extraer_ticker_del_lote(_df_lote(["AAPL", "MSFT"]), "AAPL")
+    for _, fila in propio.iterrows():
+        for columna in COLUMNAS_REQUERIDAS:
+            assert isinstance(float(fila[columna]), float)
+
+
+def test_un_ticker_que_no_viene_en_el_lote_devuelve_none():
+    """None es la señal de 'pídelo de uno en uno', no de 'está deslistado'."""
+    assert extraer_ticker_del_lote(_df_lote(["AAPL"]), "MSFT") is None
+
+
+def test_un_ticker_entero_a_nan_devuelve_none():
+    """Un deslistado viene en las columnas pero sin un solo dato. No puede
+    pasar como serie válida ni generar filas de precio."""
+    assert extraer_ticker_del_lote(_df_lote(["AAPL", "NWSLL"], vacios=("NWSLL",)), "NWSLL") is None
+    assert extraer_ticker_del_lote(_df_lote(["AAPL", "NWSLL"], vacios=("NWSLL",)), "AAPL") is not None
+
+
+def test_lote_vacio_o_ausente_devuelve_none():
+    """Si la descarga del lote falla entera, todos los tickers caen al camino
+    de uno en uno en vez de darse por perdidos."""
+    assert extraer_ticker_del_lote(None, "AAPL") is None
+    assert extraer_ticker_del_lote(pd.DataFrame(), "AAPL") is None
+
+
+def test_lote_que_vuelve_plano_se_acepta_igual():
+    """Un lote de un solo ticker puede volver sin MultiIndex."""
+    propio = extraer_ticker_del_lote(_df_plano(), "AAPL")
+    assert list(propio["Close"]) == _VALORES["Close"]
+
+
+def test_el_nivel_del_ticker_se_detecta_por_contenido_no_por_posicion():
+    """El nivel de campos es el que trae 'Open'/'Close'; el otro es el de
+    tickers. Detectarlo por contenido hace que invertir el orden de los
+    niveles no rompa nada — el tipo de suposición sobre un formato ajeno que ya
+    ha costado varios fallos en este proyecto."""
+    normal = _df_lote(["AAPL", "MSFT"])           # (campo, ticker)
+    assert nivel_de_tickers(normal.columns) == 1
+
+    invertido = normal.copy()
+    invertido.columns = pd.MultiIndex.from_tuples([(t, c) for c, t in normal.columns])
+    assert nivel_de_tickers(invertido.columns) == 0
+    assert list(extraer_ticker_del_lote(invertido, "AAPL")["Close"]) == _VALORES["Close"]
+
+
+def test_no_mezcla_valores_entre_tickers_del_mismo_lote():
+    """El fallo más caro que podría tener el modo por lotes: guardar los
+    precios de una empresa bajo el ticker de otra. Pasaría desapercibido —los
+    números son plausibles— y contaminaría todos los cálculos posteriores."""
+    columnas, datos = [], {}
+    for i, t in enumerate(["AAA", "BBB", "CCC"]):
+        for campo, valores in _VALORES.items():
+            columnas.append((campo, t))
+            datos[(campo, t)] = [v + i * 100 for v in valores]
+    lote = pd.DataFrame(datos, index=_FECHAS)
+    lote.columns = pd.MultiIndex.from_tuples(columnas)
+
+    for i, t in enumerate(["AAA", "BBB", "CCC"]):
+        propio = extraer_ticker_del_lote(lote, t)
+        assert list(propio["Close"]) == [v + i * 100 for v in _VALORES["Close"]]
