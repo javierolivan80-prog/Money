@@ -127,6 +127,28 @@ def _event_prompt(ctx: EventContext) -> str:
     return "\n".join(parts)
 
 
+def custom_id_de(event_id: int, side: str) -> str:
+    """El id de cada request dentro de un batch de la Batch API de Anthropic.
+
+    BUG REAL (2026-09-15, run 34960903955): se construía como
+    f"{event_id}:{side}", con dos puntos. La API los rechaza:
+
+        requests.0.custom_id: String should match pattern
+        '^[a-zA-Z0-9_-]{1,64}$'
+
+    y el batch entero fallaba con 400 antes de procesar una sola request —
+    el fallo estaba en la FORMA del identificador, no en su contenido, así
+    que no dependía de qué evento fuera. Con guion bajo en vez de dos puntos
+    entra dentro del patrón que exige la API.
+
+    Centralizado aquí porque el mismo formato se construye en tres sitios de
+    este módulo y se vuelve a parsear en otro más
+    (event_analysis_pipeline.py) — repetirlo a mano es la forma en que este
+    tipo de discrepancia vuelve a colarse.
+    """
+    return f"{event_id}_{side}"
+
+
 def build_bull_bear_batch(events: list[EventContext]):
     """2N requests por N eventos: una Bull, una Bear, cada una con su propio
     esquema JSON y su propio system prompt — ver docstring del módulo."""
@@ -141,7 +163,7 @@ def build_bull_bear_batch(events: list[EventContext]):
         ]:
             requests_.append(
                 Request(
-                    custom_id=f"{ctx.event_id}:{side}",
+                    custom_id=custom_id_de(ctx.event_id, side),
                     params=MessageCreateParamsNonStreaming(
                         model=config.ANALYZER_MODEL,
                         max_tokens=1024,
@@ -162,8 +184,8 @@ def build_judge_batch(events: list[EventContext], bull_bear_results: dict[str, d
 
     requests_ = []
     for ctx in events:
-        bull = bull_bear_results.get(f"{ctx.event_id}:bull")
-        bear = bull_bear_results.get(f"{ctx.event_id}:bear")
+        bull = bull_bear_results.get(custom_id_de(ctx.event_id, "bull"))
+        bear = bull_bear_results.get(custom_id_de(ctx.event_id, "bear"))
         if bull is None or bear is None:
             logger.warning("Evento %d sin Bull o Bear completo, se omite del Judge", ctx.event_id)
             continue
@@ -180,7 +202,7 @@ def build_judge_batch(events: list[EventContext], bull_bear_results: dict[str, d
         )
         requests_.append(
             Request(
-                custom_id=f"{ctx.event_id}:judge",
+                custom_id=custom_id_de(ctx.event_id, "judge"),
                 params=MessageCreateParamsNonStreaming(
                     model=config.JUDGE_MODEL,
                     max_tokens=1024,

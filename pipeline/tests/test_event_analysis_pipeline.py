@@ -41,11 +41,11 @@ class _ScriptedBatchesClient:
         out = []
         for req in self._last_requests:
             custom_id = req["custom_id"]
-            if custom_id.endswith(":bull"):
+            if custom_id.endswith("_bull"):
                 payload = {"thesis": "bull thesis", "upside_drivers": ["d1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["c1"]}
-            elif custom_id.endswith(":bear"):
+            elif custom_id.endswith("_bear"):
                 payload = {"counter_thesis": "bear thesis", "downside_risks": ["r1"], "valuation_concern": "priced in", "historical_precedent": "failed at Y", "negative_catalysts": ["n1"]}
-            elif custom_id.endswith(":judge"):
+            elif custom_id.endswith("_judge"):
                 payload = {"net_conviction": 0.6, "confidence_in_conviction": 80, "key_uncertainty": "u", "overriding_concern": "c"}
             else:
                 continue

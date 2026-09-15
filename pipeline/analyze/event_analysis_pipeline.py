@@ -38,6 +38,7 @@ from pipeline.analyze.adversarial_analyzer import (
     EventContext,
     build_bull_bear_batch,
     build_judge_batch,
+    custom_id_de,
     get_cached_analysis,
     run_batch_and_collect,
 )
@@ -184,9 +185,9 @@ def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_resu
         model_judge = cache_hit["model_version_judge"]
         batch_bb, batch_judge = None, None
     else:
-        bull_output = bull_bear_results.get(f"{event_id}:bull")
-        bear_output = bull_bear_results.get(f"{event_id}:bear")
-        judge_output = judge_results.get(f"{event_id}:judge")
+        bull_output = bull_bear_results.get(custom_id_de(event_id, "bull"))
+        bear_output = bull_bear_results.get(custom_id_de(event_id, "bear"))
+        judge_output = judge_results.get(custom_id_de(event_id, "judge"))
         if not (bull_output and bear_output and judge_output):
             logger.warning("Evento %d sin Bull/Bear/Judge completo tras el batch — se omite", event_id)
             return
