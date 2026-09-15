@@ -1,0 +1,19 @@
+Description:           Daily Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    Sep 10, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+ 
+ 
+ 
+ 
+Form Type   Company Name                                                  CIK         Date Filed  File Name
+---------------------------------------------------------------------------------------------------------------------------------------------
+1-A              Dear Air Product Technology Inc                               2134913     20260910    edgar/data/2134913/0002134913-26-000001.txt                                                
+1-A              Glow Holdings, Inc.                                           1114859     20260910    edgar/data/1114859/0001683168-26-007054.txt                                                
+1-A-W            RealtyMogul Income REIT, Inc.                                 1669664     20260910    edgar/data/1669664/0001493152-26-042139.txt                                                
+1-A/A            Global Interchange, Inc.                                      2083128     20260910    edgar/data/2083128/0001096906-26-001344.txt                                                
+8-K              ACME WIDGETS CORP                                             1234567     20260910    edgar/data/1234567/0001234567-26-000123.txt                                                
+8-K              Beta Biosciences, Inc.                                        9876543     20260910    edgar/data/9876543/0009876543-26-000045.txt                                                
+8-K/A            GAMMA HOLDINGS LLC                                            1112223     20260910    edgar/data/1112223/0001112223-26-000009.txt                                                
+10-K             DELTA INDUSTRIES INC                                          2223334     20260910    edgar/data/2223334/0002223334-26-000200.txt                                                
+8-K              EPSILON ENERGY PARTNERS LP                                    3334445     20260910    edgar/data/3334445/0003334445-26-000077.txt                                                

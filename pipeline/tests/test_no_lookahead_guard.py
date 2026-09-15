@@ -25,11 +25,22 @@ from pathlib import Path
 
 ANALYZE_DIR = Path(__file__).resolve().parent.parent / "analyze"
 
-# Tablas cuyo acceso sin acotar en el tiempo es un look-ahead potencial.
-TIME_SENSITIVE_TABLES = ("events", "car_results")
+# Tablas cuyo acceso sin acotar en el tiempo es un look-ahead potencial, y la
+# columna por la que hay que acotarlas. No es la misma para todas: los eventos
+# se conocen al cierre del día en que se presentan (d0_close_date), mientras
+# que un ejercicio contable no se conoce hasta que se presenta el 10-K semanas
+# después del cierre del período (filed_at, NO fiscal_period_end — ver la
+# cabecera de ingest/xbrl_fundamentals.py).
+TIME_SENSITIVE_TABLES: dict[str, str] = {
+    "events": "d0_close_date",
+    "car_results": "d0_close_date",
+    "fundamentals": "filed_at",
+}
 
-# Predicados que cuentan como acotación temporal válida.
-TEMPORAL_GUARD = re.compile(r"d0_close_date\s*(<|<=|BETWEEN|>=|>)", re.IGNORECASE)
+# Predicados que cuentan como acotación temporal válida, por columna.
+TEMPORAL_GUARDS: dict[str, re.Pattern] = {
+    column: re.compile(rf"{column}\s*(<|<=|BETWEEN|>=|>)", re.IGNORECASE) for column in set(TIME_SENSITIVE_TABLES.values())
+}
 
 # Excepciones documentadas. La clave es (fichero, fragmento identificativo de la
 # query); el valor es POR QUÉ es seguro. Una entrada sin motivo real aquí es
@@ -59,6 +70,19 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "Bloque __main__ del smoke test manual (--smoke-test), fuera del "
         "camino de producción."
     ),
+    (
+        "quality_score.py",
+        "SELECT * FROM fundamentals WHERE cik = %s ORDER BY fiscal_period_end",
+    ): (
+        "Rama as_of_date=None de fetch_annual_rows: vista EN VIVO del "
+        "dashboard, donde 'todo lo publicado hasta hoy' ES la respuesta "
+        "correcta — hoy no tiene futuro del que hacer look-ahead. La rama "
+        "con as_of_date (la que usaría un backtest) sí acota por filed_at, y "
+        "el docstring de la función advierte explícitamente de que en un "
+        "backtest hay que pasar la fecha simulada. Si algún día esto se usa "
+        "desde un backtest, esta entrada debe desaparecer y la rama sin "
+        "acotar con ella."
+    ),
 }
 
 
@@ -74,11 +98,23 @@ def _sql_literals(path: Path) -> list[str]:
     return out
 
 
+def _time_sensitive_tables_read(sql: str) -> list[str]:
+    """Qué tablas sensibles al tiempo lee esta query (puede ser más de una)."""
+    return [table for table in TIME_SENSITIVE_TABLES if re.search(rf"\b(FROM|JOIN)\s+{table}\b", sql, re.IGNORECASE)]
+
+
 def _reads_time_sensitive_table(sql: str) -> bool:
-    for table in TIME_SENSITIVE_TABLES:
-        if re.search(rf"\b(FROM|JOIN)\s+{table}\b", sql, re.IGNORECASE):
-            return True
-    return False
+    return bool(_time_sensitive_tables_read(sql))
+
+
+def _is_time_bounded(sql: str) -> bool:
+    """Una query está acotada si TODAS las tablas sensibles que lee tienen su
+    predicado temporal correspondiente. Basta con que falte el de una para que
+    la query pueda colar información del futuro por esa vía."""
+    tables = _time_sensitive_tables_read(sql)
+    if not tables:
+        return True
+    return all(TEMPORAL_GUARDS[TIME_SENSITIVE_TABLES[table]].search(sql) for table in tables)
 
 
 def _allowlist_reason(filename: str, sql: str) -> str | None:
@@ -89,15 +125,16 @@ def _allowlist_reason(filename: str, sql: str) -> str | None:
 
 
 def test_every_decision_path_query_is_time_bounded():
-    """Toda lectura de events/car_results en el camino de decisión se acota por
-    d0_close_date, o está allowlisted con motivo."""
+    """Toda lectura de una tabla sensible al tiempo en el camino de decisión se
+    acota por su columna correspondiente (ver TIME_SENSITIVE_TABLES), o está
+    allowlisted con motivo."""
     violations = []
 
     for path in sorted(ANALYZE_DIR.glob("*.py")):
         for sql in _sql_literals(path):
             if not _reads_time_sensitive_table(sql):
                 continue
-            if TEMPORAL_GUARD.search(sql):
+            if _is_time_bounded(sql):
                 continue
             if _allowlist_reason(path.name, sql):
                 continue
@@ -105,8 +142,9 @@ def test_every_decision_path_query_is_time_bounded():
 
     assert not violations, (
         "Query(s) sin acotar temporalmente en el camino de decisión.\n\n"
-        "Añade un predicado sobre d0_close_date, o —si de verdad es seguro— una "
-        "entrada en ALLOWLIST de este fichero explicando por qué.\n\n"
+        "Añade el predicado temporal que corresponda a cada tabla "
+        f"({TIME_SENSITIVE_TABLES}), o —si de verdad es seguro— una entrada en "
+        "ALLOWLIST de este fichero explicando por qué.\n\n"
         + "\n\n---\n\n".join(violations)
     )
 
@@ -133,10 +171,42 @@ def test_guard_detects_an_unbounded_query():
     pasaría en verde para siempre sin comprobar nada."""
     unbounded = "SELECT avg(car) FROM car_results cr JOIN events e ON e.event_id = cr.event_id"
     assert _reads_time_sensitive_table(unbounded)
-    assert not TEMPORAL_GUARD.search(unbounded)
+    assert not _is_time_bounded(unbounded)
 
     bounded = unbounded + " WHERE e.d0_close_date < %(as_of_date)s"
-    assert TEMPORAL_GUARD.search(bounded)
+    assert _is_time_bounded(bounded)
+
+
+def test_guard_covers_fundamentals_with_its_own_temporal_column():
+    """fundamentals es tan sensible al tiempo como events, pero su columna
+    anti-look-ahead es filed_at, no d0_close_date: el ejercicio cerrado el
+    31-12 no se conoce hasta que se presenta el 10-K semanas después. Acotar
+    por fiscal_period_end en vez de por filed_at daría al sistema esas semanas
+    de información del futuro — por eso NO cuenta como acotación válida."""
+    unbounded = "SELECT * FROM fundamentals WHERE cik = %s"
+    assert _reads_time_sensitive_table(unbounded)
+    assert not _is_time_bounded(unbounded)
+
+    # fiscal_period_end NO vale como guard: es la fecha del período, no la de
+    # publicación — justo la confusión que causa el look-ahead.
+    wrong_column = unbounded + " AND fiscal_period_end <= %s"
+    assert not _is_time_bounded(wrong_column)
+
+    bounded = unbounded + " AND filed_at <= %s"
+    assert _is_time_bounded(bounded)
+
+
+def test_guard_requires_every_time_sensitive_table_in_a_join_to_be_bounded():
+    """Una query que une dos tablas sensibles y solo acota una sigue pudiendo
+    colar futuro por la otra."""
+    half_bounded = (
+        "SELECT * FROM events e JOIN fundamentals f ON f.cik = e.cik "
+        "WHERE e.d0_close_date < %(as_of)s"
+    )
+    assert not _is_time_bounded(half_bounded)
+
+    fully_bounded = half_bounded + " AND f.filed_at <= %(as_of)s"
+    assert _is_time_bounded(fully_bounded)
 
 
 def test_fda_crl_8k_lookup_does_not_look_forward():

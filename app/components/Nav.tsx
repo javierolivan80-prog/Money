@@ -1,19 +1,28 @@
 import Link from "next/link";
 
-// Nav.tsx — barra de navegación compartida entre las 6 vistas de la Fase 5
-// (spec: "Dashboard con 3 columnas paralelas" + 5 tabs). Server component
-// simple, sin estado de cliente — el tab activo se resalta con el pathname
-// que cada page.tsx conoce (usePathname exigiría "use client" en todas las
-// páginas solo para esto; en vez de eso, cada página pasa su propio
-// `active`).
+// Nav.tsx — barra de navegación. Reestructurada a 5 pestañas en lenguaje
+// llano (antes eran 7 con nombres técnicos en inglés: Overview, All Signals,
+// Backtest Analysis, Calibration, Validation, Comparison, Signals This
+// Week) — pedido explícito del usuario: menos pestañas, más fáciles de
+// entender sin conocer la jerga del proyecto.
+//
+// Mapeo de dónde vivía cada cosa antes:
+//   Overview                    -> Inicio (rehecha como semáforo)
+//   All Signals                 -> Señales (misma página, reetiquetada)
+//   Backtest Analysis + Signals
+//     This Week                 -> Cartera (fusionadas: histórico + esta semana)
+//   Calibration + Validation +
+//     Comparison                -> ¿Funciona? (fusionadas: todo lo que
+//                                  responde "¿me puedo fiar de esto?")
+//   (nueva)                     -> Cómo funciona (explicación del motor,
+//                                  sin datos — para quien no conoce el proyecto)
 const TABS = [
-  { href: "/", label: "Overview" },
-  { href: "/signals", label: "All Signals" },
-  { href: "/portfolio", label: "Backtest Analysis" },
-  { href: "/calibration", label: "Calibration" },
-  { href: "/validation", label: "Validation" },
-  { href: "/comparison", label: "Comparison" },
-  { href: "/week", label: "Signals This Week" },
+  { href: "/", label: "Inicio" },
+  { href: "/senales", label: "Señales" },
+  { href: "/largo-plazo", label: "Largo plazo" },
+  { href: "/cartera", label: "Cartera" },
+  { href: "/funciona", label: "¿Funciona?" },
+  { href: "/como-funciona", label: "Cómo funciona" },
 ] as const;
 
 export function Nav({ active }: { active: string }) {

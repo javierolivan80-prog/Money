@@ -1,0 +1,13 @@
+Description:           Daily Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    August 14, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+Cloud HTTP:            https://www.sec.gov/Archives/edgar/
+
+Form Type   Company Name                                                  CIK         Date Filed  File Name
+-------------------------------------------------------------------------------------------------------------------------------------------
+8-K         ACME WIDGETS CORP                                             0001234567  2026-08-14  edgar/data/1234567/0001234567-26-000123.txt
+8-K         BETA BIOSCIENCES INC                                          0009876543  2026-08-14  edgar/data/9876543/0009876543-26-000045.txt
+8-K/A       GAMMA HOLDINGS LLC                                            0001112223  2026-08-14  edgar/data/1112223/0001112223-26-000009.txt
+10-K        DELTA INDUSTRIES INC                                          0002223334  2026-08-14  edgar/data/2223334/0002223334-26-000200.txt
+8-K         EPSILON ENERGY PARTNERS LP                                    0003334445  2026-08-14  edgar/data/3334445/0003334445-26-000077.txt

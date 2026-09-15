@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from pipeline import config
-from pipeline.ingest.edgar_http import throttled_get
+from pipeline.ingest.edgar_http import throttled_get, throttled_get_header
 
 logger = logging.getLogger(__name__)
 
@@ -79,86 +79,192 @@ def daily_index_url(day: date) -> str:
     )
 
 
-def parse_daily_index(raw_text: str) -> list[dict]:
-    """Parsea el .idx de ancho fijo de EDGAR.
+def archive_url(file_name: str) -> str:
+    """URL absoluta de un documento a partir de la ruta que da el daily-index.
 
-    Formato (tras la cabecera y una línea de guiones separadora):
-      Form Type   Company Name   CIK   Date Filed   File Name
-    Columnas de ancho fijo, no separadas por un delimitador único — hay que
-    usar las posiciones de la línea de guiones para saber dónde corta cada campo.
-    Filtra solo form_type == '8-K' (exacto, para no capturar 8-K/A como si fuera
-    igual — las enmiendas se tratan aparte, no en el POC).
+    BUG REAL (2026-09-15): el índice trae rutas RELATIVAS al árbol de archivo
+    ('edgar/data/320193/0000320193-26-000123.txt'), y ese árbol cuelga de
+    /Archives/. El código pegaba la ruta directamente al dominio, produciendo
+    https://www.sec.gov/edgar/data/... — un 404 en TODOS y cada uno de los
+    filings. Lo mismo valía para source_url, la dirección que se guarda en la
+    base de datos y con la que después se descarga el texto del filing y se
+    enlaza desde la interfaz: todos rotos.
+
+    Curiosamente daily_index_url sí ponía /Archives/ (justo encima); la
+    diferencia entre las dos funciones no se notaba porque el fallo no rompía
+    nada de forma visible, solo hacía que no se ingestara ni un evento.
     """
-    lines = raw_text.splitlines()
-    # La línea separadora real de EDGAR es de la forma "---- ---- ----" (grupos
-    # de guiones por columna, separados por espacios) — no una tira de guiones
-    # continua. set(l.strip()) == {"-"} fallaba contra el formato real por eso.
-    def is_separator(line: str) -> bool:
-        stripped = line.strip()
-        return bool(stripped) and set(stripped) <= {"-", " "} and "-" in stripped
+    path = file_name.lstrip("/")
+    if not path.startswith("Archives/"):
+        path = f"Archives/{path}"
+    return f"{config.EDGAR_BASE}/{path}"
 
-    sep_idx = next((i for i, l in enumerate(lines) if is_separator(l)), None)
-    if sep_idx is None:
-        raise ValueError("Formato de daily-index inesperado: no se encontró la línea separadora")
 
-    header = lines[sep_idx - 1]
-    sep_line = lines[sep_idx]
-    # Cada columna empieza donde EMPIEZA su tramo de guiones (no donde termina):
-    # los tramos de guiones están separados por espacios, y cortar en el inicio
-    # de cada tramo deja el espacio de separación como parte del campo previo,
-    # que igualmente se descarta con .strip() en cut().
-    col_starts = [
-        i for i in range(len(sep_line)) if sep_line[i] == "-" and (i == 0 or sep_line[i - 1] != "-")
-    ]
+# Una fila de datos del daily-index, reconocida por su ESTRUCTURA y no por la
+# posición de sus columnas: tipo de formulario, nombre de empresa, CIK
+# (dígitos), fecha ISO y ruta del fichero, separados por 2+ espacios.
+#
+# POR QUÉ ASÍ Y NO POR POSICIONES (bug real, encontrado en producción el
+# 2026-09-14): la versión anterior derivaba el corte de cada columna de la
+# línea de guiones, asumiendo que EDGAR la publica en tramos por columna
+# ("---- ---- ----"). Cuando el separador es en cambio una TIRA CONTINUA de
+# guiones, esa lógica colapsa a una sola columna, form_type pasa a ser la línea
+# entera, y la comparación `form_type != "8-K"` descarta TODAS las filas. El
+# resultado era 0 eventos cada día, con HTTP 200 y sin una sola excepción: el
+# pipeline entero corría en verde sobre una base de datos vacía.
+#
+# El fixture de los tests se había escrito con el formato segmentado (nunca se
+# pudo descargar el fichero real desde el sandbox, egress bloqueado), así que
+# los tests confirmaban la suposición equivocada en vez de contrastarla.
+# Anclarse en el CIK y la fecha ISO hace el parseo independiente de anchos y
+# de la forma del separador.
+_ROW_RE = re.compile(
+    r"^(?P<form_type>\S.*?)\s{2,}"        # tipo de formulario
+    r"(?P<company_name>\S.*?)\s{2,}"      # nombre (puede contener espacios simples)
+    r"(?P<cik>\d{1,10})\s+"               # CIK
+    # FECHA: el fichero REAL de EDGAR la trae COMPACTA (20260910), no en ISO.
+    # Esto es lo único que fallaba del parseo, y costó dos intentos a ciegas
+    # descubrirlo: el fixture inventado usaba guiones. Se acepta también el
+    # formato con guiones por tolerancia, pero el real es el de 8 dígitos.
+    r"(?P<date_filed>\d{8}|\d{4}-\d{2}-\d{2})\s+"
+    r"(?P<file_name>\S+)\s*$"             # ruta del documento
+)
 
-    def cut(line: str, i: int) -> str:
-        # La última columna (File Name) es de longitud variable y más larga que
-        # su cabecera de dashes — corta hasta el final real de la línea de datos,
-        # no hasta una posición fija derivada de la cabecera.
-        end = col_starts[i + 1] if i + 1 < len(col_starts) else len(line)
-        return line[col_starts[i] : end].strip()
 
-    rows = []
-    for line in lines[sep_idx + 1 :]:
-        if not line.strip():
+def _normalize_filed_date(raw: str) -> str:
+    """A ISO (YYYY-MM-DD), que es lo que espera el resto del pipeline
+    (scrape_day hace strptime con '%Y-%m-%d')."""
+    return raw if "-" in raw else f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+
+
+def parse_daily_index(raw_text: str) -> list[dict]:
+    """Parsea el .idx diario de EDGAR y devuelve solo los 8-K.
+
+    Independiente del ancho de columna y de la forma de la línea separadora
+    (ver _ROW_RE). Filtra form_type == '8-K' exacto, para no capturar 8-K/A:
+    las enmiendas se tratan aparte, no en el POC.
+
+    Lanza si NINGUNA línea del fichero tiene forma de fila de datos. Un
+    daily-index de un día hábil siempre trae filings de algún tipo; cero
+    filas reconocibles significa que el formato cambió o que la descarga no es
+    lo que se espera, y eso tiene que romper el pipeline en vez de dejarlo
+    correr en verde sobre una base vacía — que es exactamente lo que pasó
+    cuando esto devolvía [] en silencio.
+    """
+    all_rows, eight_k = 0, []
+    for line in raw_text.splitlines():
+        match = _ROW_RE.match(line)
+        if match is None:
             continue
-        form_type = cut(line, 0)
-        if form_type != "8-K":
+        all_rows += 1
+        if match.group("form_type") != "8-K":
             continue
-        rows.append(
+        eight_k.append(
             {
-                "form_type": form_type,
-                "company_name": cut(line, 1),
-                "cik": cut(line, 2).lstrip("0") or "0",
-                "date_filed": cut(line, 3),
-                "file_name": cut(line, 4),
+                "form_type": match.group("form_type"),
+                "company_name": match.group("company_name").strip(),
+                "cik": match.group("cik").lstrip("0") or "0",
+                "date_filed": _normalize_filed_date(match.group("date_filed")),
+                "file_name": match.group("file_name"),
             }
         )
-    return rows
+
+    if all_rows == 0:
+        # Volcado del principio del fichero EN EL PROPIO ERROR. Sin esto,
+        # arreglar el parser es adivinar: desde el entorno de desarrollo no hay
+        # salida de red hacia sec.gov (AUDIT_LEAN.md §1.5), así que la ÚNICA
+        # forma de ver cómo es el fichero de verdad es que el runner que sí
+        # puede descargarlo lo imprima cuando falla. Es la lección del bug
+        # anterior: dos parsers seguidos escritos contra un formato supuesto.
+        preview = "\n".join(f"    | {line[:200]}" for line in raw_text.splitlines()[:15])
+        raise ValueError(
+            "Formato de daily-index inesperado: ninguna línea tiene forma de fila de datos "
+            "(tipo, empresa, CIK, fecha, fichero). ¿Cambió el formato de EDGAR?\n"
+            f"Primeras líneas de lo que devolvió el servidor ({len(raw_text)} caracteres):\n{preview}"
+        )
+
+    return eight_k
 
 
 # Títulos oficiales de Item de la Form 8-K (definidos por la propia SEC, estables
 # por regulación — a diferencia del formato exacto de la cabecera SGML, esto no
 # cambia). Se usan como fallback si la cabecera imprime el título en vez del
 # número: ver advertencia en fetch_filing_item_codes.
+#
+# CONFIRMADO EN PRODUCCIÓN (2026-09-15, run 34939563551): EDGAR imprime el
+# TÍTULO, no el número. La cabecera real dice:
+#
+#     ITEM INFORMATION:		Regulation FD Disclosure
+#
+# y nunca "7.01". Así que esto no es el fallback: es la vía principal.
+#
+# POR QUÉ ESTÁN TODOS Y NO SOLO LOS 8 QUE INTERESAN: la lista tenía únicamente
+# los Items dentro del alcance, así que un 8-K cuyos Items caían todos fuera
+# (un 'Regulation FD Disclosure', por ejemplo) no producía NINGÚN código y se
+# contaba como "sin Items extraídos" — la señal de que el formato de la
+# cabecera no se entiende. El log decía "55 sin Items, 0 sin clase relevante"
+# cuando la verdad era justo la contraria: se entendían perfectamente y
+# quedaban fuera de alcance a propósito. Con la lista completa, "sin Items"
+# vuelve a significar solo una cosa: que hay que ir a mirar el formato.
+#
+# Las claves son FRAGMENTOS distintivos del título oficial, no el título
+# entero, para no depender de la puntuación (apóstrofos, puntos y comas) que
+# varía entre filings.
 ITEM_TITLE_TO_NUMBER = {
+    # Sección 1 — negocio y operaciones
     "entry into a material definitive agreement": "1.01",
+    "termination of a material definitive agreement": "1.02",
+    "bankruptcy or receivership": "1.03",
+    "mine safety": "1.04",
+    "material cybersecurity incident": "1.05",
+    # Sección 2 — información financiera
     "completion of acquisition or disposition of assets": "2.01",
     "results of operations and financial condition": "2.02",
-    "bankruptcy or receivership": "1.03",
-    "changes in registrant's certifying accountant": "4.01",
+    "creation of a direct financial obligation": "2.03",
+    "triggering events that accelerate": "2.04",
+    "costs associated with exit or disposal": "2.05",
+    "material impairment": "2.06",
+    # Sección 3 — valores y mercados
+    "notice of delisting": "3.01",
+    "unregistered sales of equity securities": "3.02",
+    "material modification to rights of security holders": "3.03",
+    # Sección 4 — auditores y estados financieros
+    "certifying accountant": "4.01",
     "non-reliance on previously issued financial statements": "4.02",
+    # Sección 5 — gobierno corporativo
+    "changes in control of registrant": "5.01",
     "departure of directors or certain officers": "5.02",
+    "amendments to articles of incorporation": "5.03",
+    "temporary suspension of trading": "5.04",
+    "code of ethics": "5.05",
+    "change in shell company status": "5.06",
+    "submission of matters to a vote of security holders": "5.07",
+    "shareholder director nominations": "5.08",
+    # Sección 6 — titulizaciones
+    "abs informational and computational material": "6.01",
+    "change of servicer or trustee": "6.02",
+    "change in credit enhancement": "6.03",
+    "failure to make a required distribution": "6.04",
+    "securities act updating disclosure": "6.05",
+    # Secciones 7-9
+    "regulation fd disclosure": "7.01",
     "other events": "8.01",
+    "financial statements and exhibits": "9.01",
 }
 
 
-def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
-    """Descarga el .txt de submission completo y extrae accession number + Items.
+def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str], str]:
+    """Descarga la CABECERA del submission y extrae accession number + Items.
 
     El nombre de fichero del .idx apunta al submission completo
     (.../{accession-sin-guiones}.txt), que en su cabecera SGML incluye una línea
-    "ITEM INFORMATION:" por cada Item reportado en el 8-K.
+    "ITEM INFORMATION:" por cada Item reportado en el 8-K. Solo se descarga esa
+    cabecera (throttled_get_header), no el cuerpo con los anexos: ver el motivo
+    medido en edgar_http.throttled_get_header.
+
+    Devuelve también el texto de la cabecera para que el caller pueda volcarlo
+    al log cuando no extrae ningún Item — sin ver el formato real no hay forma
+    de arreglar un extractor que nunca se pudo validar en vivo.
 
     ADVERTENCIA — sin verificar en vivo (egress bloqueado, AUDIT_LEAN.md §1.5):
     no hay certeza de si esa línea imprime el NÚMERO del Item ("2.02") o su
@@ -168,9 +274,7 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
     ITEM_TITLE_TO_NUMBER. Verificar contra 2-3 filings reales antes del
     backfill completo (ver --single-day en el bloque __main__).
     """
-    url = f"{config.EDGAR_BASE}/{file_name}"
-    resp = throttled_get(url)
-    text = resp.text
+    text = throttled_get_header(archive_url(file_name))
     accession_match = re.search(r"ACCESSION NUMBER:\s*(\S+)", text)
     accession = accession_match.group(1) if accession_match else file_name
 
@@ -182,11 +286,14 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
             items.append(numeric.group(1))
             continue
         title_key = line.lower().rstrip(".")
-        for title, number in ITEM_TITLE_TO_NUMBER.items():
-            if title in title_key:
-                items.append(number)
-                break
-    return accession, items
+        # Se queda con la coincidencia MÁS LARGA, no con la primera: parar en
+        # la primera hacía que el resultado dependiera del orden del
+        # diccionario, y basta con que un fragmento corto aparezca dentro de un
+        # título más largo para clasificar mal el Item.
+        coincidencias = [(t, n) for t, n in ITEM_TITLE_TO_NUMBER.items() if t in title_key]
+        if coincidencias:
+            items.append(max(coincidencias, key=lambda par: len(par[0]))[1])
+    return accession, items, text
 
 
 def classify_event_classes(item_codes: list[str]) -> list[str]:
@@ -228,13 +335,43 @@ def scrape_day(day: date) -> list[RawFiling]:
     logger.info("%d formularios 8-K encontrados el %s", len(rows), day.isoformat())
 
     filings = []
+    # Contadores de descarte. Sin esto, un 8-K que se descarga y luego se tira
+    # es invisible: el log solo decía cuántos se ENCONTRARON, no cuántos
+    # sobrevivían hasta la base de datos. Con el parser del índice arreglado
+    # aparecieron cientos de filings al día y aun así no llegaba ninguno —
+    # imposible de localizar sin saber en cuál de los dos filtros caían.
+    sin_items, sin_clase, no_descargados = 0, 0, 0
     for row in rows:
         try:
-            accession, item_codes = fetch_filing_item_codes(row["file_name"])
+            accession, item_codes, header_text = fetch_filing_item_codes(row["file_name"])
         except RuntimeError as exc:
-            logger.error("Saltando %s: %s", row["file_name"], exc)
+            no_descargados += 1
+            if no_descargados <= 3:
+                logger.error("Saltando %s: %s", row["file_name"], exc)
+            continue
+        if not item_codes:
+            sin_items += 1
+            if sin_items <= 3:
+                # Volcado de diagnóstico de los primeros casos: si la cabecera
+                # SGML no trae 'ITEM INFORMATION:' con el formato esperado, el
+                # pipeline entero se queda sin eventos y hay que VER el formato
+                # real para arreglarlo (ver ADVERTENCIA en
+                # fetch_filing_item_codes: nunca se pudo validar contra un
+                # filing de verdad desde el sandbox).
+                #
+                # El volcado no es opcional: exactamente esta técnica —imprimir
+                # lo que devuelve el servidor en vez de suponerlo— fue lo que
+                # destapó que las fechas del daily-index venían compactas y no
+                # en ISO, después de dos arreglos a ciegas que no acertaron.
+                preview = "\n".join(f"    | {ln[:200]}" for ln in header_text.splitlines()[:40])
+                logger.warning(
+                    "Sin Items extraídos de %s — revisar formato de cabecera.\n"
+                    "Primeras líneas de la cabecera que devolvió EDGAR:\n%s",
+                    row["file_name"], preview,
+                )
             continue
         if not classify_event_classes(item_codes):
+            sin_clase += 1
             continue  # ninguna clase relevante, se descarta (no es data loss: es scope)
         raw_hash = hashlib.sha256(f"{accession}:{sorted(item_codes)}".encode()).hexdigest()
         filed_at = datetime.strptime(row["date_filed"], "%Y-%m-%d")
@@ -246,9 +383,34 @@ def scrape_day(day: date) -> list[RawFiling]:
                 form_type=row["form_type"],
                 filed_at=filed_at,
                 item_codes=item_codes,
-                source_url=f"{config.EDGAR_BASE}/{row['file_name']}",
+                source_url=archive_url(row["file_name"]),
                 raw_text_hash=raw_hash,
             )
+        )
+
+    if no_descargados == len(rows) and rows:
+        # NINGÚN filing se pudo descargar: eso no son documentos retirados ni
+        # una racha de mala suerte, es la URL mal construida o EDGAR
+        # rechazando al cliente. Es lo que pasó el 2026-09-15 (faltaba
+        # /Archives/ en la ruta) y hay que distinguirlo del caso de abajo.
+        logger.warning(
+            "%s: no se pudo descargar NINGUNO de los %d formularios 8-K — "
+            "¿es correcta la URL que construye archive_url()?",
+            day.isoformat(), len(rows),
+        )
+    elif rows and not filings:
+        # Todos los 8-K del día descargados y ninguno sobrevive: eso no es
+        # "scope", es un parser roto. Que se vea en el log como lo que es.
+        logger.warning(
+            "%s: %d formularios 8-K descargados y NINGUNO utilizable "
+            "(%d sin Items extraídos, %d sin clase de evento relevante, %d no descargados)",
+            day.isoformat(), len(rows), sin_items, sin_clase, no_descargados,
+        )
+    else:
+        logger.info(
+            "%s: %d de %d formularios utilizables "
+            "(%d sin Items, %d sin clase relevante, %d no descargados)",
+            day.isoformat(), len(filings), len(rows), sin_items, sin_clase, no_descargados,
         )
     return filings
 

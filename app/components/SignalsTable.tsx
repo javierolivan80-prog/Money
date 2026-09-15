@@ -25,7 +25,7 @@ const columns = [
   columnHelper.accessor("event_class", { header: "Evento", cell: (c) => c.getValue().replace(/^8K_/, "") }),
   columnHelper.accessor("source", { header: "Fuente" }),
   columnHelper.accessor("novelty_score", {
-    header: "Novelty",
+    header: "Sorpresa",
     cell: (c) => (
       <div className="flex items-center gap-1 w-20">
         <div className="flex-1 bg-neutral-200 dark:bg-neutral-800 rounded h-1.5">
@@ -36,13 +36,13 @@ const columns = [
     ),
   }),
   columnHelper.accessor("signal", {
-    header: "Signal",
+    header: "Decisión",
     cell: (c) => <span className={`font-medium ${SIGNAL_COLORS[c.getValue()]}`}>{c.getValue()}</span>,
   }),
-  columnHelper.accessor("confidence", { header: "Confidence", cell: (c) => `${c.getValue().toFixed(0)}%` }),
-  columnHelper.accessor("ev_balanced", { header: "EV (Balanced)", cell: (c) => `${(c.getValue() * 100).toFixed(2)}%` }),
+  columnHelper.accessor("confidence", { header: "Confianza", cell: (c) => `${c.getValue().toFixed(0)}%` }),
+  columnHelper.accessor("ev_balanced", { header: "Valor esperado", cell: (c) => `${(c.getValue() * 100).toFixed(2)}%` }),
   columnHelper.accessor("pnl_pct", {
-    header: "P&L (Balanced, si operó)",
+    header: "Resultado (si se operó)",
     cell: (c) => {
       const v = c.getValue();
       if (v === null) return "—";

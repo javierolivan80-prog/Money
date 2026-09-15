@@ -38,6 +38,7 @@ def upsert_universe_entries(conn: psycopg.Connection, filings: list) -> None:
     aquí (eso requiere market cap/ADV, que vienen de prices — se calcula
     después, en un paso de mantenimiento de universo separado).
     """
+    sin_ticker = 0
     with conn.cursor() as cur:
         for f in filings:
             ticker = resolve_ticker(f.cik)
@@ -47,6 +48,7 @@ def upsert_universe_entries(conn: psycopg.Connection, filings: list) -> None:
                 # NULL para no perder el evento silenciosamente, pero
                 # in_investable_universe se queda en FALSE (default) y el
                 # backtester debe ignorar estas filas.
+                sin_ticker += 1
                 logger.debug("Sin ticker para CIK %s (%s), se omite de universe", f.cik, f.company_name)
                 continue
             cur.execute(
@@ -66,6 +68,19 @@ def upsert_universe_entries(conn: psycopg.Connection, filings: list) -> None:
                 },
             )
     conn.commit()
+
+    if filings and sin_ticker == len(filings):
+        # NINGÚN CIK resolvió a ticker: eso no son "fondos y insiders", es el
+        # mapa CIK->ticker roto o vacío (ticker_map.py). Sin universe no hay
+        # precios, ni CAR, ni análisis — el pipeline entero corre en verde
+        # sobre nada. Tiene que verse.
+        logger.warning(
+            "Ninguno de los %d filings resolvió a un ticker cotizado — "
+            "¿está bien el mapa CIK->ticker (ingest/ticker_map.py)?",
+            len(filings),
+        )
+    elif sin_ticker:
+        logger.info("%d de %d filings sin ticker cotizado (fondos, insiders...)", sin_ticker, len(filings))
 
 
 def upsert_events(
