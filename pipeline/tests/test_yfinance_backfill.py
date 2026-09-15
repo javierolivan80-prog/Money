@@ -203,3 +203,69 @@ def test_no_mezcla_valores_entre_tickers_del_mismo_lote():
     for i, t in enumerate(["AAA", "BBB", "CCC"]):
         propio = extraer_ticker_del_lote(lote, t)
         assert list(propio["Close"]) == [v + i * 100 for v in _VALORES["Close"]]
+
+
+# --- No volver a bajar lo que ya está ---------------------------------------
+#
+# Medido: 1h 24m para redescargar exactamente los mismos ~500 días de 150
+# tickers que la ejecución anterior ya había guardado. El paso se reejecuta en
+# cada pasada y pedía siempre el rango completo.
+
+from datetime import date as _date
+
+from pipeline.ingest.yfinance_backfill import pendientes_de_descarga
+
+_INICIO, _FIN = _date(2025, 4, 28), _date(2026, 9, 15)
+
+
+def test_un_ticker_ya_al_dia_no_se_vuelve_a_pedir():
+    a_pedir, al_dia = pendientes_de_descarga({"AAPL": _FIN}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == []
+    assert al_dia == ["AAPL"]
+
+
+def test_un_ticker_nunca_descargado_se_pide_entero():
+    a_pedir, al_dia = pendientes_de_descarga({}, ["NUEVA"], _INICIO, _FIN)
+    assert a_pedir == [("NUEVA", _INICIO)]
+    assert al_dia == []
+
+
+def test_solo_se_pide_la_cola_que_falta():
+    """Lo que hace que una reejecución dure segundos: si hay precios hasta el
+    día 10, se piden desde el 11, no desde hace 500 días."""
+    a_pedir, _ = pendientes_de_descarga({"AAPL": _date(2026, 9, 10)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == [("AAPL", _date(2026, 9, 11))]
+
+
+def test_no_se_pide_de_nuevo_el_ultimo_dia_guardado():
+    """Se empieza en el día SIGUIENTE al último guardado. Volver a pedirlo no
+    daría datos malos —el upsert es idempotente— pero sí un día de más en cada
+    ejecución, todos los días."""
+    a_pedir, _ = pendientes_de_descarga({"AAPL": _date(2026, 9, 10)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir[0][1] > _date(2026, 9, 10)
+
+
+def test_nunca_se_pide_antes_del_inicio_solicitado():
+    """Un ticker con histórico más antiguo que el rango pedido no debe
+    ensanchar la descarga hacia atrás."""
+    a_pedir, al_dia = pendientes_de_descarga({"AAPL": _date(2020, 1, 1)}, ["AAPL"], _INICIO, _FIN)
+    assert a_pedir == [("AAPL", _INICIO)]
+    assert al_dia == []
+
+
+def test_el_caso_real_de_produccion_no_pide_nada():
+    """150 tickers guardados hasta la fecha final: una reejecución no debe
+    hacer ni una petición. Ese es el escenario que costó hora y media."""
+    tickers = [f"T{i}" for i in range(150)]
+    a_pedir, al_dia = pendientes_de_descarga({t: _FIN for t in tickers}, tickers, _INICIO, _FIN)
+    assert a_pedir == []
+    assert len(al_dia) == 150
+
+
+def test_mezcla_de_tickers_al_dia_nuevos_y_a_medias():
+    ultimos = {"ALDIA": _FIN, "AMEDIAS": _date(2026, 9, 1)}
+    a_pedir, al_dia = pendientes_de_descarga(
+        ultimos, ["ALDIA", "AMEDIAS", "NUEVA"], _INICIO, _FIN
+    )
+    assert al_dia == ["ALDIA"]
+    assert dict(a_pedir) == {"AMEDIAS": _date(2026, 9, 2), "NUEVA": _INICIO}

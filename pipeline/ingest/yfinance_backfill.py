@@ -41,6 +41,7 @@ BATCH_SIZE = 50           # tickers por lote — margen de sobra bajo el umbral 
 PAUSE_BETWEEN_BATCHES_S = 5
 MAX_RETRIES = 4
 BACKOFF_BASE_S = 2         # 2, 4, 8, 16 — misma política que el resto del proyecto
+DOWNLOAD_THREADS = 8       # descargas en paralelo dentro de un lote (ver _descargar_lote_con_reintentos)
 
 
 def _trading_days_expected(start: date, end: date) -> set[date]:
@@ -162,7 +163,13 @@ def _descargar_lote_con_reintentos(tickers: list[str], start: date, end: date) -
                 end=(end + timedelta(days=1)).isoformat(),
                 auto_adjust=False,
                 progress=False,
-                threads=False,
+                # threads=False hacía que yfinance recorriera el lote EN SERIE
+                # por dentro: agrupar no quitaba ni una petición, solo movía el
+                # bucle dentro de la librería. Por eso el primer run con lotes
+                # tardó lo mismo (1h 24m). Un número modesto y explícito, no
+                # True: el límite de Yahoo no está documentado y con 50 hilos a
+                # la vez el 429 es seguro.
+                threads=DOWNLOAD_THREADS,
             )
         except Exception as exc:  # yfinance no tiene jerarquía de excepciones estable
             espera = BACKOFF_BASE_S * (2**intento)
@@ -200,12 +207,82 @@ def extraer_ticker_del_lote(df: pd.DataFrame | None, ticker: str) -> pd.DataFram
     return propio if not propio.empty else None
 
 
-def backfill_tickers(tickers: list[str], start: date, end: date) -> None:
+def ultimo_dia_guardado(conn, tickers: list[str]) -> dict[str, date]:
+    """Último día con precio ya almacenado, por ticker."""
+    if not tickers:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ticker, MAX(trade_date) AS ultimo FROM prices "
+            "WHERE ticker = ANY(%s) AND close_raw IS NOT NULL GROUP BY ticker",
+            (list(tickers),),
+        )
+        return {r["ticker"]: r["ultimo"] for r in cur.fetchall() if r["ultimo"] is not None}
+
+
+def pendientes_de_descarga(
+    ultimo_por_ticker: dict[str, date], tickers: list[str], start: date, end: date
+) -> tuple[list[tuple[str, date]], list[str]]:
+    """Reparte los tickers en (los que hay que pedir, con desde qué fecha) y
+    (los que ya están al día).
+
+    POR QUÉ (medido: 1h 24m en el run 34948... para volver a bajar exactamente
+    lo que ya estaba en la base de datos): el paso se reejecuta en cada pasada
+    y volvía a pedir el rango COMPLETO de los ~500 días de cada ticker, aunque
+    la ejecución anterior ya los hubiera guardado. Descargar solo lo que falta
+    convierte una reejecución de hora y media en segundos.
+
+    Es coherente con el diseño del módulo: close_raw y adj_factor se guardan
+    por separado precisamente para que el histórico no haya que rebajarlo
+    cuando cambian los ajustes por splits y dividendos (ver cabecera). Para
+    forzar una redescarga completa está --forzar.
+    """
+    a_pedir: list[tuple[str, date]] = []
+    al_dia: list[str] = []
+    for ticker in tickers:
+        ultimo = ultimo_por_ticker.get(ticker)
+        if ultimo is None:
+            a_pedir.append((ticker, start))  # nunca descargado: rango entero
+            continue
+        desde = max(start, ultimo + timedelta(days=1))
+        if desde > end:
+            al_dia.append(ticker)
+        else:
+            a_pedir.append((ticker, desde))
+    return a_pedir, al_dia
+
+
+def backfill_tickers(tickers: list[str], start: date, end: date, forzar: bool = False) -> None:
     from pipeline.db.connection import get_connection
 
     conn = get_connection()
     expected_days = _trading_days_expected(start, end)
 
+    if forzar:
+        a_pedir, al_dia = [(t, start) for t in tickers], []
+    else:
+        a_pedir, al_dia = pendientes_de_descarga(
+            ultimo_dia_guardado(conn, tickers), tickers, start, end
+        )
+    if al_dia:
+        logger.info("%d de %d tickers ya al día, no se vuelven a pedir", len(al_dia), len(tickers))
+    if not a_pedir:
+        logger.info("Nada que descargar: los %d tickers ya cubren hasta %s", len(tickers), end)
+        return
+
+    # Se agrupan por fecha de inicio para que cada lote sea una sola petición
+    # con un rango común. En la práctica casi todos comparten fecha.
+    por_fecha: dict[date, list[str]] = {}
+    for ticker, desde in a_pedir:
+        por_fecha.setdefault(desde, []).append(ticker)
+
+    for desde, tickers_desde in sorted(por_fecha.items()):
+        logger.info("%d tickers a descargar desde %s", len(tickers_desde), desde)
+        _descargar_grupo(conn, tickers_desde, desde, end, expected_days)
+    logger.info("Backfill de precios completo para %d tickers", len(tickers))
+
+
+def _descargar_grupo(conn, tickers: list[str], start: date, end: date, expected_days: set[date]) -> None:
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i : i + BATCH_SIZE]
         logger.info("Lote %d-%d de %d tickers", i, i + len(batch), len(tickers))
@@ -240,7 +317,6 @@ def backfill_tickers(tickers: list[str], start: date, end: date) -> None:
             _store_with_gap_detection(conn, ticker, df, expected_days)
 
         time.sleep(PAUSE_BETWEEN_BATCHES_S)
-    logger.info("Backfill de precios completo para %d tickers", len(tickers))
 
 
 def _flag_full_gap(conn, ticker: str, start: date, end: date) -> None:
@@ -322,6 +398,11 @@ if __name__ == "__main__":
     parser.add_argument("--tickers", type=str, required=True, help="Fichero con un ticker por línea, o lista separada por comas")
     parser.add_argument("--start", type=str, default=config.BACKTEST_START)
     parser.add_argument("--end", type=str, default=config.BACKTEST_END)
+    parser.add_argument(
+        "--forzar",
+        action="store_true",
+        help="Rebaja el rango entero aunque ya esté guardado (por defecto solo se pide lo que falta)",
+    )
     args = parser.parse_args()
 
     from datetime import datetime as _dt
@@ -336,4 +417,5 @@ if __name__ == "__main__":
         ticker_list,
         _dt.strptime(args.start, "%Y-%m-%d").date(),
         _dt.strptime(args.end, "%Y-%m-%d").date(),
+        forzar=args.forzar,
     )
