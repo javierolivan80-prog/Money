@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from pipeline import config
-from pipeline.ingest.edgar_http import throttled_get
+from pipeline.ingest.edgar_http import throttled_get, throttled_get_header
 
 logger = logging.getLogger(__name__)
 
@@ -181,12 +181,18 @@ ITEM_TITLE_TO_NUMBER = {
 }
 
 
-def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
-    """Descarga el .txt de submission completo y extrae accession number + Items.
+def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str], str]:
+    """Descarga la CABECERA del submission y extrae accession number + Items.
 
     El nombre de fichero del .idx apunta al submission completo
     (.../{accession-sin-guiones}.txt), que en su cabecera SGML incluye una línea
-    "ITEM INFORMATION:" por cada Item reportado en el 8-K.
+    "ITEM INFORMATION:" por cada Item reportado en el 8-K. Solo se descarga esa
+    cabecera (throttled_get_header), no el cuerpo con los anexos: ver el motivo
+    medido en edgar_http.throttled_get_header.
+
+    Devuelve también el texto de la cabecera para que el caller pueda volcarlo
+    al log cuando no extrae ningún Item — sin ver el formato real no hay forma
+    de arreglar un extractor que nunca se pudo validar en vivo.
 
     ADVERTENCIA — sin verificar en vivo (egress bloqueado, AUDIT_LEAN.md §1.5):
     no hay certeza de si esa línea imprime el NÚMERO del Item ("2.02") o su
@@ -197,8 +203,7 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
     backfill completo (ver --single-day en el bloque __main__).
     """
     url = f"{config.EDGAR_BASE}/{file_name}"
-    resp = throttled_get(url)
-    text = resp.text
+    text = throttled_get_header(url)
     accession_match = re.search(r"ACCESSION NUMBER:\s*(\S+)", text)
     accession = accession_match.group(1) if accession_match else file_name
 
@@ -214,7 +219,7 @@ def fetch_filing_item_codes(file_name: str) -> tuple[str, list[str]]:
             if title in title_key:
                 items.append(number)
                 break
-    return accession, items
+    return accession, items, text
 
 
 def classify_event_classes(item_codes: list[str]) -> list[str]:
@@ -264,7 +269,7 @@ def scrape_day(day: date) -> list[RawFiling]:
     sin_items, sin_clase = 0, 0
     for row in rows:
         try:
-            accession, item_codes = fetch_filing_item_codes(row["file_name"])
+            accession, item_codes, header_text = fetch_filing_item_codes(row["file_name"])
         except RuntimeError as exc:
             logger.error("Saltando %s: %s", row["file_name"], exc)
             continue
@@ -277,7 +282,17 @@ def scrape_day(day: date) -> list[RawFiling]:
                 # real para arreglarlo (ver ADVERTENCIA en
                 # fetch_filing_item_codes: nunca se pudo validar contra un
                 # filing de verdad desde el sandbox).
-                logger.warning("Sin Items extraídos de %s — revisar formato de cabecera", row["file_name"])
+                #
+                # El volcado no es opcional: exactamente esta técnica —imprimir
+                # lo que devuelve el servidor en vez de suponerlo— fue lo que
+                # destapó que las fechas del daily-index venían compactas y no
+                # en ISO, después de dos arreglos a ciegas que no acertaron.
+                preview = "\n".join(f"    | {ln[:200]}" for ln in header_text.splitlines()[:40])
+                logger.warning(
+                    "Sin Items extraídos de %s — revisar formato de cabecera.\n"
+                    "Primeras líneas de la cabecera que devolvió EDGAR:\n%s",
+                    row["file_name"], preview,
+                )
             continue
         if not classify_event_classes(item_codes):
             sin_clase += 1
