@@ -253,7 +253,13 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python -m pipeline.analyze.event_analysis_pipeline
 
+      # Estos tres pasos NO usan la IA: trabajan sobre lo que ya hay en la base
+      # de datos. Con '!cancelled()' se ejecutan aunque el análisis de eventos
+      # haya fallado (por ejemplo por falta de ANTHROPIC_API_KEY), en vez de
+      # caerse con él. El run sigue marcándose como fallido — lo que no se
+      # pierde es el resto del trabajo.
       - name: Backtest de cartera (3 versiones — portfolio_simulator.py)
+        if: ${{ !cancelled() }}
         # Corre las 3 versiones sobre TODOS los eventos con trade_decision de
         # event_analyses. Es acumulativo por diseño de simulate_portfolio
         # (usa fetch_events_for_version, no filtra por "nuevos desde ayer"),
@@ -264,6 +270,7 @@ jobs:
         run: python -m pipeline.backtest.portfolio_report
 
       - name: Validación estadística (Fase 6 — event study, sensibilidad, veredicto)
+        if: ${{ !cancelled() }}
         # Reutiliza el portfolio_report que acaba de guardar el paso anterior
         # (mismo run_batch_tag fecha+sha) — no resimula la cartera. Guarda en
         # validation_reports (Postgres), no en docs/VALIDATION_REPORT.md: un
@@ -276,6 +283,7 @@ jobs:
         run: python -m pipeline.validation.report --persist-only
 
       - name: Paper trading semanal (Fase 4 — paper_trading/report.py)
+        if: ${{ !cancelled() }}
         # Simula la última semana COMPLETA de datos disponibles como si
         # fuera "futura" (select_simulation_week en paper_trading/simulator.py).
         # A diferencia del backtest de cartera, esto SÍ tiene estado

@@ -348,10 +348,26 @@ if __name__ == "__main__":
     import anthropic
 
     logging.basicConfig(level=logging.INFO)
+    from pipeline import config
     from pipeline.db.connection import get_connection
 
+    # Comprobación por delante, antes de tocar la base de datos. Sin esto, la
+    # falta de la clave sale como un TypeError desde las tripas del SDK
+    # ("Could not resolve authentication method...") veinte líneas de traza más
+    # abajo, que no dice qué hay que hacer ni quién tiene que hacerlo.
+    if not config.ANTHROPIC_API_KEY:
+        raise SystemExit(
+            "Falta ANTHROPIC_API_KEY. Este paso es el único del pipeline que la\n"
+            "necesita: es el que construye el debate Bull/Bear/Juez de cada evento.\n"
+            "Se configura como secreto del repositorio en GitHub:\n"
+            "  Settings > Secrets and variables > Actions > New repository secret\n"
+            "  Nombre: ANTHROPIC_API_KEY\n"
+            "Sin ella no se generan señales nuevas, pero el resto del pipeline\n"
+            "(precios, CAR, backtest, validación, largo plazo) sigue funcionando."
+        )
+
     conn = get_connection()
-    client = anthropic.Anthropic()  # requiere ANTHROPIC_API_KEY
+    client = anthropic.Anthropic()
 
     processed = run_pipeline(conn, client)
     print(f"Procesados {processed} eventos")
