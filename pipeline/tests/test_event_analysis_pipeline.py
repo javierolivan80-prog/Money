@@ -352,6 +352,86 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
     assert float(rows[1]["net_conviction"]) == pytest.approx(float(rows[0]["net_conviction"]))
 
 
+def test_process_chunk_skips_llm_for_low_novelty_event_but_still_forces_no_trade(conn):
+    """Optimización de coste (pedida explícitamente para gastar menos en la
+    API de Anthropic): abstention_engine.NOVELTY_FLOOR hace NO_TRADE en las 3
+    estrategias para cualquier evento con novelty_score por debajo del
+    umbral, SIN mirar lo que diga Bull/Bear/Judge — es la PRIMERA de las 7
+    condiciones que evalúa decide_for_strategy (ver su docstring). Pagar el
+    debate de IA en ese caso no cambia ni una sola decisión, así que
+    process_chunk debe descartarlo ANTES de construir el batch, no después.
+
+    Se fuerza aquí un pre_event_drift_pct enorme (el precio de TESTCO ya subió
+    un 30% justo antes del evento, así que el mercado lo tenía completamente
+    descontado) — eso hunde novelty.score muy por debajo de NOVELTY_FLOOR=20
+    (ver DRIFT_SATURATION_PCT=8.0 en novelty.py). Se verifica que el cliente
+    de IA scripted nunca recibe una sola request Y que el veredicto final es
+    idéntico al que habría dado el mismo camino con Bull/Bear/Judge reales."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    d0 = dates[280].date()
+    _seed_event(conn, "1", "TESTCO", d0)
+
+    # dates[280] (d0) es 2022-01-31 (lunes): D-5 calendario cae en 2022-01-26
+    # (miércoles, índice 277 — un business day en sí mismo, no un fin de
+    # semana) y D-1 calendario cae en el domingo 2022-01-30, cuyo
+    # nearest_at_or_before es el viernes 2022-01-28 (índice 279). Por eso el
+    # corte va en 278: todo lo anterior (incluido 277 = D-5) se deja en 50,
+    # y desde 278 (que cubre 279 = D-1) se sube a 65 — verificado con un
+    # cálculo directo de fetch_and_compute_enrichment antes de escribir esto,
+    # no a ojo (un desajuste de un índice aquí deja el drift en 0%, no en 30%).
+    with conn.cursor() as cur:
+        for i in range(260, 278):
+            cur.execute("UPDATE prices SET close_raw=50.0, high_raw=50.5, low_raw=49.5 WHERE ticker='TESTCO' AND trade_date=%s", (dates[i].date(),))
+        for i in range(278, 281):
+            cur.execute("UPDATE prices SET close_raw=65.0, high_raw=65.5, low_raw=64.5 WHERE ticker='TESTCO' AND trade_date=%s", (dates[i].date(),))
+    conn.commit()
+
+    scripted_client = _ScriptedBatchesClient()
+    client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
+    events = fetch_events_needing_analysis(conn)
+    assert len(events) == 1
+
+    conn = process_chunk(conn, client, events)
+
+    assert scripted_client.call_count == 0  # cero llamadas a la Batch API: cero tokens gastados
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM event_analyses")
+        row = cur.fetchone()
+    assert float(row["novelty_score"]) < 20
+    assert row["model_version_bull_bear"] == "SKIPPED_LOW_NOVELTY"
+    assert row["model_version_judge"] == "SKIPPED_LOW_NOVELTY"
+    assert row["trade_decision_conservative"] == "NO_TRADE"
+    assert row["trade_decision_aggressive"] == "NO_TRADE"
+    assert row["trade_decision_balanced"] == "NO_TRADE"
+    bull_output = row["bull_analyst_output"] if isinstance(row["bull_analyst_output"], dict) else json.loads(row["bull_analyst_output"])
+    assert bull_output["skipped_low_novelty"] is True
+
+
+def test_process_chunk_high_novelty_event_still_calls_llm_as_before(conn):
+    """Contraprueba de la anterior: un evento con novelty normal (el drift
+    plano que ya seedeaba _seed_market_data, sin el salto de precio forzado)
+    tiene que seguir llamando a Bull/Bear/Judge exactamente igual que antes
+    del pre-filtro — el ahorro es solo para los eventos que iban a ser
+    NO_TRADE de todas formas, nunca para los demás."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    scripted_client = _ScriptedBatchesClient()
+    client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
+
+    assert scripted_client.call_count == 2  # bull/bear + judge, como siempre
+    with conn.cursor() as cur:
+        cur.execute("SELECT model_version_bull_bear FROM event_analyses")
+        row = cur.fetchone()
+    assert row["model_version_bull_bear"] == "claude-haiku-4-5"
+
+
 # ---------------------------------------------------------------------------
 # Fase 3 — filing_text real y guidance/rumor fluyendo hasta event_analyses
 # ---------------------------------------------------------------------------

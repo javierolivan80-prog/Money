@@ -33,7 +33,7 @@ import logging
 from datetime import date, timedelta
 
 from pipeline import config
-from pipeline.analyze.abstention_engine import AbstentionInputs, as_json as abstention_as_json, decide_all_strategies
+from pipeline.analyze.abstention_engine import NOVELTY_FLOOR, AbstentionInputs, as_json as abstention_as_json, decide_all_strategies
 from pipeline.analyze.adversarial_analyzer import (
     EventContext,
     build_bull_bear_batch,
@@ -136,14 +136,45 @@ def process_chunk(conn, client, event_rows: list[dict]):
         else:
             needs_llm.append(ev)
 
-    logger.info("Chunk de %d eventos: %d en caché, %d requieren LLM", len(event_rows), len(cache_hits), len(needs_llm))
+    # Pre-filtro de novelty (Etapa 2, adelantada): abstention_engine.py aplica
+    # `if novelty_score < NOVELTY_FLOOR: NO_TRADE` como la PRIMERA de sus 7
+    # condiciones, antes incluso de mirar lo que dijeron Bull/Bear/Judge. Eso
+    # significa que para un evento con novelty baja, el resultado final es
+    # NO_TRADE en las 3 estrategias SIN IMPORTAR qué responda el debate de
+    # IA — pagar ese debate no cambia ni una sola decisión, solo gasta
+    # tokens. novelty se calcula aquí (enrichment + guidance/rumor, ambos
+    # solo Postgres, sin coste) ANTES de construir el batch, para no invocar
+    # Bull/Bear/Judge en los eventos que van a descartarse igual.
+    precomputed_by_id: dict[int, tuple] = {}
+    llm_candidates: list[dict] = []
+    skipped_low_novelty_ids: set[int] = set()
+    for ev in needs_llm:
+        enrichment = fetch_and_compute_enrichment(conn, ev)
+        has_guidance, rumor_flag = compute_novelty_signals(conn, ev["ticker"], ev["d0_close_date"])
+        novelty = compute_novelty(
+            NoveltyInputs(
+                pre_event_drift_pct=enrichment.pre_event_drift_pct or 0.0,
+                has_prior_guidance=has_guidance,
+                rumor_flag=rumor_flag,
+            )
+        )
+        precomputed_by_id[ev["event_id"]] = (enrichment, novelty)
+        if novelty.score < NOVELTY_FLOOR:
+            skipped_low_novelty_ids.add(ev["event_id"])
+        else:
+            llm_candidates.append(ev)
+
+    logger.info(
+        "Chunk de %d eventos: %d en caché, %d requieren LLM, %d descartados por novelty < %d (NO_TRADE garantizado igualmente, se ahorra el debate de IA)",
+        len(event_rows), len(cache_hits), len(llm_candidates), len(skipped_low_novelty_ids), NOVELTY_FLOOR,
+    )
 
     bull_bear_results: dict[str, dict] = {}
     judge_results: dict[str, dict] = {}
     bb_batch_id = None
     judge_batch_id = None
 
-    if needs_llm:
+    if llm_candidates:
         contexts = [
             EventContext(
                 event_id=ev["event_id"],
@@ -155,7 +186,7 @@ def process_chunk(conn, client, event_rows: list[dict]):
                 # texto todavía no debe bloquear el análisis, solo empobrecerlo.
                 filing_excerpt=ev["filing_text"] or _FALLBACK_FILING_EXCERPT,
             )
-            for ev in needs_llm
+            for ev in llm_candidates
         ]
         bull_bear_results, bb_batch_id = run_batch_and_collect(client, build_bull_bear_batch(contexts))
         judge_results, judge_batch_id = run_batch_and_collect(client, build_judge_batch(contexts, bull_bear_results))
@@ -185,7 +216,12 @@ def process_chunk(conn, client, event_rows: list[dict]):
 
     for ev in event_rows:
         try:
-            _process_single_event(conn, ev, cache_hits.get(ev["event_id"]), bull_bear_results, judge_results, bb_batch_id, judge_batch_id)
+            event_id = ev["event_id"]
+            _process_single_event(
+                conn, ev, cache_hits.get(event_id), bull_bear_results, judge_results, bb_batch_id, judge_batch_id,
+                precomputed=precomputed_by_id.get(event_id),
+                skipped_low_novelty=event_id in skipped_low_novelty_ids,
+            )
         except Exception:
             logger.exception("Fallo analizando evento %d — se continúa con el siguiente", ev["event_id"])
             # Sin rollback, "se continúa con el siguiente" es mentira cuando el
@@ -210,28 +246,39 @@ def process_chunk(conn, client, event_rows: list[dict]):
     return conn
 
 
-def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_results: dict, judge_results: dict, bb_batch_id: str | None, judge_batch_id: str | None) -> None:
+def _process_single_event(
+    conn, ev: dict, cache_hit: dict | None, bull_bear_results: dict, judge_results: dict, bb_batch_id: str | None, judge_batch_id: str | None,
+    precomputed: tuple | None = None, skipped_low_novelty: bool = False,
+) -> None:
     event_id = ev["event_id"]
 
     # --- Etapa 1: enrichment (SIEMPRE fresco — ver docstring del módulo) ---
-    enrichment = fetch_and_compute_enrichment(conn, ev)
-
     # --- Etapa 2: novelty (SIEMPRE fresco) ---
-    # Fase 3: has_prior_guidance/rumor_flag ya no son siempre None — se
-    # calculan sobre filing_text de eventos previos del mismo ticker (ver
-    # guidance_detector.py). Si esos filings aún no tienen texto extraído,
-    # compute_novelty_signals devuelve None y compute_novelty renormaliza
-    # pesos igual que antes (comportamiento sin cambios en ese caso).
-    has_guidance, rumor_flag = compute_novelty_signals(conn, ev["ticker"], ev["d0_close_date"])
-    novelty = compute_novelty(
-        NoveltyInputs(
-            pre_event_drift_pct=enrichment.pre_event_drift_pct or 0.0,
-            has_prior_guidance=has_guidance,
-            rumor_flag=rumor_flag,
+    # Si process_chunk ya las calculó para decidir el pre-filtro de novelty
+    # (ver su docstring), se reutilizan aquí en vez de repetir las mismas
+    # consultas a Postgres — no cambia el resultado, solo evita el trabajo
+    # duplicado. Los cache_hits no pasan por ese pre-filtro (no lo necesitan,
+    # no van a llamar al LLM), así que para ellos se calculan aquí igual que
+    # siempre.
+    if precomputed is not None:
+        enrichment, novelty = precomputed
+    else:
+        enrichment = fetch_and_compute_enrichment(conn, ev)
+        # Fase 3: has_prior_guidance/rumor_flag ya no son siempre None — se
+        # calculan sobre filing_text de eventos previos del mismo ticker (ver
+        # guidance_detector.py). Si esos filings aún no tienen texto extraído,
+        # compute_novelty_signals devuelve None y compute_novelty renormaliza
+        # pesos igual que antes (comportamiento sin cambios en ese caso).
+        has_guidance, rumor_flag = compute_novelty_signals(conn, ev["ticker"], ev["d0_close_date"])
+        novelty = compute_novelty(
+            NoveltyInputs(
+                pre_event_drift_pct=enrichment.pre_event_drift_pct or 0.0,
+                has_prior_guidance=has_guidance,
+                rumor_flag=rumor_flag,
+            )
         )
-    )
 
-    # --- Etapas 3-5: Bull/Bear/Judge (de caché o de LLM) ---
+    # --- Etapas 3-5: Bull/Bear/Judge (de caché, de LLM, o descartado por novelty baja) ---
     from_cache = cache_hit is not None
     if from_cache:
         bull_output = cache_hit["bull_analyst_output"]
@@ -241,6 +288,22 @@ def _process_single_event(conn, ev: dict, cache_hit: dict | None, bull_bear_resu
         confidence_in_conviction = float(cache_hit["confidence_in_conviction"])
         model_bull_bear = cache_hit["model_version_bull_bear"]
         model_judge = cache_hit["model_version_judge"]
+        batch_bb, batch_judge = None, None
+    elif skipped_low_novelty:
+        # No se invocó Bull/Bear/Judge para este evento: novelty.score ya
+        # está por debajo de abstention_engine.NOVELTY_FLOOR, y esa regla es
+        # la PRIMERA que evalúa decide_for_strategy — dispara NO_TRADE en las
+        # 3 estrategias sin mirar net_conviction/confidence en absoluto. Un
+        # net_conviction=0/confidence=0 aquí no cambia el veredicto final,
+        # solo dice explícitamente "no se gastó IA en este evento" en vez de
+        # simular una opinión que nunca se le pidió al modelo.
+        bull_output = {"skipped_low_novelty": True, "reason": f"novelty_score={novelty.score:.0f} < {NOVELTY_FLOOR} — NO_TRADE garantizado, no se invoca el debate de IA"}
+        bear_output = {"skipped_low_novelty": True, "reason": f"novelty_score={novelty.score:.0f} < {NOVELTY_FLOOR} — NO_TRADE garantizado, no se invoca el debate de IA"}
+        judge_output = {"skipped_low_novelty": True, "reason": f"novelty_score={novelty.score:.0f} < {NOVELTY_FLOOR} — NO_TRADE garantizado, no se invoca el debate de IA"}
+        net_conviction = 0.0
+        confidence_in_conviction = 0.0
+        model_bull_bear = "SKIPPED_LOW_NOVELTY"
+        model_judge = "SKIPPED_LOW_NOVELTY"
         batch_bb, batch_judge = None, None
     else:
         bull_output = bull_bear_results.get(custom_id_de(event_id, "bull"))
