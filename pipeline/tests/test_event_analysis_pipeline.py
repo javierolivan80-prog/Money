@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from pipeline.tests.fake_batch_api import validar_requests_como_la_api
+
 pytestmark = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL no definida")
 
 
@@ -30,6 +32,7 @@ class _ScriptedBatchesClient:
         self.call_count = 0
 
     def create(self, requests):
+        validar_requests_como_la_api(requests)
         self.call_count += 1
         self._last_requests = requests
         return SimpleNamespace(id=f"batch_{self.call_count}", processing_status="ended")
@@ -241,6 +244,7 @@ class _ClientQueMataLaConexion:
         self._ultima_tanda = None
 
     def create(self, requests):
+        validar_requests_como_la_api(requests)
         self._ultima_tanda = requests
         return SimpleNamespace(id="batch_mortal", processing_status="in_progress")
 
@@ -506,3 +510,29 @@ def test_process_chunk_novelty_reasoning_reflects_prior_guidance_detection(conn)
         row = cur.fetchone()
     reasoning = row["novelty_reasoning"] if isinstance(row["novelty_reasoning"], dict) else json.loads(row["novelty_reasoning"])
     assert reasoning["has_prior_guidance"] is True
+
+
+def test_judge_fuera_de_rango_no_se_guarda(conn):
+    """P0-2: sin minimum/maximum en el esquema, el rango se valida en Python.
+    Un Judge con net_conviction=3 no debe llegar a event_analyses (ni recortado
+    a 1: sería la convicción máxima inventada)."""
+    from pipeline.analyze import event_analysis_pipeline as eap
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    class _JudgeDesbocado(_ScriptedBatchesClient):
+        def results(self, batch_id):
+            out = super().results(batch_id)
+            for r in out:
+                if r.custom_id.endswith("_judge"):
+                    r.result.message.content[0].text = json.dumps(
+                        {"net_conviction": 3, "confidence_in_conviction": 80, "key_uncertainty": "u", "overriding_concern": "c"}
+                    )
+            return out
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_JudgeDesbocado()))
+    conn = eap.process_chunk(conn, client, eap.fetch_events_needing_analysis(conn))
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM event_analyses")
+        assert cur.fetchone()["n"] == 0

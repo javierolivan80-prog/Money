@@ -12,13 +12,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from pipeline.tests.fake_batch_api import claves_no_soportadas, validar_requests_como_la_api
+
 from pipeline.analyze.adversarial_analyzer import (
+    BEAR_SCHEMA,
+    BULL_SCHEMA,
+    JUDGE_SCHEMA,
     EventContext,
     build_bull_bear_batch,
     build_judge_batch,
     custom_id_de,
     get_cached_analysis,
     run_batch_and_collect,
+    validar_salida_judge,
 )
 
 
@@ -107,6 +113,7 @@ class _FakeBatchesClient:
         self._batch_state = SimpleNamespace(id="batch_test123", processing_status="ended")
 
     def create(self, requests):
+        validar_requests_como_la_api(requests)
         return self._batch_state
 
     def retrieve(self, batch_id):
@@ -114,17 +121,17 @@ class _FakeBatchesClient:
 
     def results(self, batch_id):
         return [
-            _mock_batch_result("1:judge", "succeeded", {"net_conviction": 0.6, "confidence_in_conviction": 75, "key_uncertainty": "u", "overriding_concern": "c"}),
-            _mock_batch_result("2:judge", "errored"),
+            _mock_batch_result(custom_id_de(1, "judge"), "succeeded", {"net_conviction": 0.6, "confidence_in_conviction": 75, "key_uncertainty": "u", "overriding_concern": "c"}),
+            _mock_batch_result(custom_id_de(2, "judge"), "errored"),
         ]
 
 
 def test_run_batch_and_collect_skips_errored_results():
     client = SimpleNamespace(messages=SimpleNamespace(batches=_FakeBatchesClient()))
-    results, batch_id = run_batch_and_collect(client, requests_=[{"custom_id": "1:judge"}])
+    results, batch_id = run_batch_and_collect(client, requests_=[{"custom_id": custom_id_de(1, "judge")}])
     assert batch_id == "batch_test123"
-    assert set(results.keys()) == {"1:judge"}
-    assert results["1:judge"]["net_conviction"] == 0.6
+    assert set(results.keys()) == {custom_id_de(1, "judge")}
+    assert results[custom_id_de(1, "judge")]["net_conviction"] == 0.6
 
 
 def test_run_batch_and_collect_sin_requests_no_crea_batch():
@@ -276,3 +283,75 @@ def test_custom_id_es_reversible_por_sufijo():
     assert custom_id_de(42, "bull") != custom_id_de(42, "bear")
     assert custom_id_de(42, "bull").endswith("_bull")
     assert not custom_id_de(423, "bull").endswith("_3_bull")  # sin arrastrar dígitos del id
+
+
+# --- P0-2: esquemas compatibles con structured outputs y rango del Judge ---
+
+
+@pytest.mark.parametrize("nombre,schema", [("BULL", BULL_SCHEMA), ("BEAR", BEAR_SCHEMA), ("JUDGE", JUDGE_SCHEMA)])
+def test_ningun_esquema_usa_restricciones_que_structured_outputs_no_admite(nombre, schema):
+    """Regresión del fallo real: minimum/maximum en JUDGE_SCHEMA hacía que la
+    API marcase `errored` el 100% de las requests del Judge (595 en dos runs)."""
+    assert claves_no_soportadas(schema) == [], f"{nombre}_SCHEMA"
+
+
+def test_el_batch_del_judge_real_pasa_el_validador_de_la_api():
+    evento = _sample_event(event_id=7)
+    resultados = {
+        custom_id_de(7, "bull"): {"thesis": "x", "upside_drivers": ["a"], "addressable_market": "b",
+                                  "comparable_events": "c", "catalysts_forward": ["d"]},
+        custom_id_de(7, "bear"): {"counter_thesis": "x", "downside_risks": ["a"], "valuation_concern": "b",
+                                  "historical_precedent": "c", "negative_catalysts": ["d"]},
+    }
+    validar_requests_como_la_api(build_bull_bear_batch([evento]))
+    validar_requests_como_la_api(build_judge_batch([evento], resultados))
+
+
+@pytest.mark.parametrize("conviction,confidence", [(0.6, 80), (-1, 0), (1, 100), (-1.0, 100.0), (0, 50)])
+def test_validar_salida_judge_acepta_el_rango_incluidos_los_extremos(conviction, confidence):
+    out = validar_salida_judge({"net_conviction": conviction, "confidence_in_conviction": confidence,
+                                "key_uncertainty": "u", "overriding_concern": "c"})
+    assert out is not None
+    assert out["net_conviction"] == float(conviction)
+    assert out["confidence_in_conviction"] == float(confidence)
+    assert isinstance(out["net_conviction"], float)
+    assert out["key_uncertainty"] == "u"  # el resto de campos se conserva
+
+
+@pytest.mark.parametrize("conviction,confidence", [
+    (1.01, 50), (-1.5, 50), (3, 50),          # conviction fuera de [-1, 1]
+    (0.5, -0.1), (0.5, 100.5), (0.5, 150),    # confidence fuera de [0, 100]
+    (float("nan"), 50), (0.5, float("nan")),  # NaN
+    (True, 50), (0.5, False),                 # bool (subclase de int en Python)
+    ("0.5", 50), (0.5, "80"), (None, 50),     # no numéricos
+])
+def test_validar_salida_judge_rechaza_fuera_de_rango_sin_recortar(conviction, confidence):
+    assert validar_salida_judge({"net_conviction": conviction, "confidence_in_conviction": confidence}) is None
+
+
+def test_validar_salida_judge_rechaza_campos_ausentes_o_no_dict():
+    assert validar_salida_judge({"net_conviction": 0.5}) is None
+    assert validar_salida_judge({"confidence_in_conviction": 50}) is None
+    assert validar_salida_judge(None) is None
+    assert validar_salida_judge([0.5, 50]) is None
+
+
+def test_run_batch_and_collect_registra_el_motivo_del_error(caplog):
+    """Sin el motivo, los 595 Judge fallidos no dejaron ninguna pista."""
+    error = SimpleNamespace(type="invalid_request", message="schema: 'minimum' is not supported")
+    resultado = SimpleNamespace(custom_id=custom_id_de(1, "judge"), result=SimpleNamespace(type="errored", error=error))
+
+    class _Cliente:
+        def create(self, requests):
+            return SimpleNamespace(id="b", processing_status="ended")
+
+        def retrieve(self, batch_id):
+            return SimpleNamespace(id=batch_id, processing_status="ended")
+
+        def results(self, batch_id):
+            return [resultado]
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_Cliente()))
+    with caplog.at_level("WARNING"):
+        run_batch_and_collect(client, [{"custom_id": custom_id_de(1, "judge")}])
+    assert "minimum" in caplog.text

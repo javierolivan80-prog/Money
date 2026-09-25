@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from pipeline.tests.fake_batch_api import validar_requests_como_la_api
+
 from pipeline.ingest.universe_maintenance import is_investable
 
 pytestmark_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL no definida")
@@ -168,7 +170,7 @@ class _ClienteQueFalla:
         self.creates = 0
 
     def create(self, requests):
-        assert requests, "batch vacío: la API real lo rechaza con un 400"
+        validar_requests_como_la_api(requests)
         self.creates += 1
         self.sizes = getattr(self, "sizes", []) + [len(requests)]
         self._reqs = requests

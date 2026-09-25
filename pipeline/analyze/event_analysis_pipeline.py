@@ -41,6 +41,7 @@ from pipeline.analyze.adversarial_analyzer import (
     custom_id_de,
     get_cached_analysis,
     run_batch_and_collect,
+    validar_salida_judge,
 )
 from pipeline.analyze.enrichment import fetch_and_compute_enrichment
 from pipeline.analyze.ev_engine import compute_ev
@@ -370,7 +371,8 @@ def _process_single_event(
     else:
         bull_output = bull_bear_results.get(custom_id_de(event_id, "bull"))
         bear_output = bull_bear_results.get(custom_id_de(event_id, "bear"))
-        judge_output = judge_results.get(custom_id_de(event_id, "judge"))
+        judge_id = custom_id_de(event_id, "judge")
+        judge_output = validar_salida_judge(judge_results.get(judge_id), judge_id)
         if not (bull_output and bear_output and judge_output):
             logger.warning("Evento %d sin Bull/Bear/Judge completo tras el batch — se omite", event_id)
             return
