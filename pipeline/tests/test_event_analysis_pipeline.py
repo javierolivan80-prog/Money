@@ -41,11 +41,11 @@ class _ScriptedBatchesClient:
         out = []
         for req in self._last_requests:
             custom_id = req["custom_id"]
-            if custom_id.endswith(":bull"):
+            if custom_id.endswith("_bull"):
                 payload = {"thesis": "bull thesis", "upside_drivers": ["d1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["c1"]}
-            elif custom_id.endswith(":bear"):
+            elif custom_id.endswith("_bear"):
                 payload = {"counter_thesis": "bear thesis", "downside_risks": ["r1"], "valuation_concern": "priced in", "historical_precedent": "failed at Y", "negative_catalysts": ["n1"]}
-            elif custom_id.endswith(":judge"):
+            elif custom_id.endswith("_judge"):
                 payload = {"net_conviction": 0.6, "confidence_in_conviction": 80, "key_uncertainty": "u", "overriding_concern": "c"}
             else:
                 continue
@@ -228,6 +228,78 @@ def test_day3_stats_in_expected_range(conn):
 # ---------------------------------------------------------------------------
 
 
+class _ClientQueMataLaConexion:
+    """Imita lo que le pasó a producción (run 34964242549): mientras
+    run_batch_and_collect espera a la Batch API, la conexión a Postgres muere
+    de verdad (Neon corta las conexiones ociosas; la espera real duró unos 20
+    minutos). El primer retrieve() mata la conexión Y devuelve "ended" en la
+    misma llamada, así el test no necesita dormir de verdad."""
+
+    def __init__(self, conexion_a_matar):
+        self._conn = conexion_a_matar
+        self._matada = False
+        self._ultima_tanda = None
+
+    def create(self, requests):
+        self._ultima_tanda = requests
+        return SimpleNamespace(id="batch_mortal", processing_status="in_progress")
+
+    def retrieve(self, batch_id):
+        if not self._matada:
+            self._conn.close()
+            self._matada = True
+        return SimpleNamespace(id=batch_id, processing_status="ended")
+
+    def results(self, batch_id):
+        out = []
+        for req in self._ultima_tanda:
+            custom_id = req["custom_id"]
+            if custom_id.endswith("_bull"):
+                payload = {"thesis": "bull thesis", "upside_drivers": ["d1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["c1"]}
+            elif custom_id.endswith("_bear"):
+                payload = {"counter_thesis": "bear thesis", "downside_risks": ["r1"], "valuation_concern": "priced in", "historical_precedent": "failed at Y", "negative_catalysts": ["n1"]}
+            elif custom_id.endswith("_judge"):
+                payload = {"net_conviction": 0.6, "confidence_in_conviction": 80, "key_uncertainty": "u", "overriding_concern": "c"}
+            else:
+                continue
+            content_block = SimpleNamespace(type="text", text=json.dumps(payload))
+            message = SimpleNamespace(content=[content_block])
+            result = SimpleNamespace(type="succeeded", message=message)
+            out.append(SimpleNamespace(custom_id=custom_id, result=result))
+        return out
+
+
+def test_process_chunk_reconecta_si_la_conexion_muere_durante_la_espera_del_batch(conn):
+    """EL bug real: 20 minutos esperando la Batch API dejaban la conexión
+    ociosa hasta que Postgres la cortaba. El síntoma no salía en el batch —
+    salía en el primer INSERT de después, con "the connection is lost", y el
+    propio rollback de recuperación reventaba igual, tirando el chunk entero
+    pese a que la IA ya había respondido. process_chunk tiene que detectarlo
+    y reconectar ANTES de escribir, no después de que el primer INSERT
+    reviente."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_ClientQueMataLaConexion(conn)))
+    events = fetch_events_needing_analysis(conn)
+    assert len(events) == 1
+
+    conn_nueva = process_chunk(conn, client, events)
+
+    assert conn_nueva is not conn  # se reconectó, no siguió con la muerta
+    assert conn.closed  # la vieja, la que mató el fake client, sigue cerrada
+
+    with conn_nueva.cursor() as cur:
+        cur.execute("SELECT * FROM event_analyses")
+        rows = cur.fetchall()
+    assert len(rows) == 1  # el análisis se guardó pese a la reconexión
+    conn_nueva.close()
+
+
+
+
 def test_process_chunk_end_to_end_writes_full_event_analyses_row(conn):
     from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
 
@@ -238,7 +310,7 @@ def test_process_chunk_end_to_end_writes_full_event_analyses_row(conn):
     events = fetch_events_needing_analysis(conn)
     assert len(events) == 1
 
-    process_chunk(conn, client, events)
+    conn = process_chunk(conn, client, events)
 
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM event_analyses")
@@ -261,14 +333,14 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
 
     scripted_client = _ScriptedBatchesClient()
     client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
     assert scripted_client.call_count == 2  # una llamada para bull/bear, otra para judge
 
     # Segundo evento: mismo ticker, misma clase, al día hábil siguiente (mismo
     # episodio, p. ej. una corrección) -> debe reusar Bull/Bear/Judge de caché
     # y NO generar nuevas llamadas al cliente.
     _seed_event(conn, "1", "TESTCO", dates[281].date())
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
 
     assert scripted_client.call_count == 2  # sin llamadas nuevas: se sirvió de caché
 
@@ -289,10 +361,90 @@ def test_process_chunk_otro_trimestre_del_mismo_ticker_no_usa_cache(conn):
     _seed_event(conn, "1", "TESTCO", dates[280].date())
     scripted_client = _ScriptedBatchesClient()
     client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
     _seed_event(conn, "1", "TESTCO", dates[290].date())
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
     assert scripted_client.call_count == 4
+
+
+def test_process_chunk_skips_llm_for_low_novelty_event_but_still_forces_no_trade(conn):
+    """Optimización de coste (pedida explícitamente para gastar menos en la
+    API de Anthropic): abstention_engine.NOVELTY_FLOOR hace NO_TRADE en las 3
+    estrategias para cualquier evento con novelty_score por debajo del
+    umbral, SIN mirar lo que diga Bull/Bear/Judge — es la PRIMERA de las 7
+    condiciones que evalúa decide_for_strategy (ver su docstring). Pagar el
+    debate de IA en ese caso no cambia ni una sola decisión, así que
+    process_chunk debe descartarlo ANTES de construir el batch, no después.
+
+    Se fuerza aquí un pre_event_drift_pct enorme (el precio de TESTCO ya subió
+    un 30% justo antes del evento, así que el mercado lo tenía completamente
+    descontado) — eso hunde novelty.score muy por debajo de NOVELTY_FLOOR=20
+    (ver DRIFT_SATURATION_PCT=8.0 en novelty.py). Se verifica que el cliente
+    de IA scripted nunca recibe una sola request Y que el veredicto final es
+    idéntico al que habría dado el mismo camino con Bull/Bear/Judge reales."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    d0 = dates[280].date()
+    _seed_event(conn, "1", "TESTCO", d0)
+
+    # dates[280] (d0) es 2022-01-31 (lunes): D-5 calendario cae en 2022-01-26
+    # (miércoles, índice 277 — un business day en sí mismo, no un fin de
+    # semana) y D-1 calendario cae en el domingo 2022-01-30, cuyo
+    # nearest_at_or_before es el viernes 2022-01-28 (índice 279). Por eso el
+    # corte va en 278: todo lo anterior (incluido 277 = D-5) se deja en 50,
+    # y desde 278 (que cubre 279 = D-1) se sube a 65 — verificado con un
+    # cálculo directo de fetch_and_compute_enrichment antes de escribir esto,
+    # no a ojo (un desajuste de un índice aquí deja el drift en 0%, no en 30%).
+    with conn.cursor() as cur:
+        for i in range(260, 278):
+            cur.execute("UPDATE prices SET close_raw=50.0, high_raw=50.5, low_raw=49.5 WHERE ticker='TESTCO' AND trade_date=%s", (dates[i].date(),))
+        for i in range(278, 281):
+            cur.execute("UPDATE prices SET close_raw=65.0, high_raw=65.5, low_raw=64.5 WHERE ticker='TESTCO' AND trade_date=%s", (dates[i].date(),))
+    conn.commit()
+
+    scripted_client = _ScriptedBatchesClient()
+    client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
+    events = fetch_events_needing_analysis(conn)
+    assert len(events) == 1
+
+    conn = process_chunk(conn, client, events)
+
+    assert scripted_client.call_count == 0  # cero llamadas a la Batch API: cero tokens gastados
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM event_analyses")
+        row = cur.fetchone()
+    assert float(row["novelty_score"]) < 20
+    assert row["model_version_bull_bear"] == "SKIPPED_LOW_NOVELTY"
+    assert row["model_version_judge"] == "SKIPPED_LOW_NOVELTY"
+    assert row["trade_decision_conservative"] == "NO_TRADE"
+    assert row["trade_decision_aggressive"] == "NO_TRADE"
+    assert row["trade_decision_balanced"] == "NO_TRADE"
+    bull_output = row["bull_analyst_output"] if isinstance(row["bull_analyst_output"], dict) else json.loads(row["bull_analyst_output"])
+    assert bull_output["skipped_low_novelty"] is True
+
+
+def test_process_chunk_high_novelty_event_still_calls_llm_as_before(conn):
+    """Contraprueba de la anterior: un evento con novelty normal (el drift
+    plano que ya seedeaba _seed_market_data, sin el salto de precio forzado)
+    tiene que seguir llamando a Bull/Bear/Judge exactamente igual que antes
+    del pre-filtro — el ahorro es solo para los eventos que iban a ser
+    NO_TRADE de todas formas, nunca para los demás."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+
+    scripted_client = _ScriptedBatchesClient()
+    client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
+
+    assert scripted_client.call_count == 2  # bull/bear + judge, como siempre
+    with conn.cursor() as cur:
+        cur.execute("SELECT model_version_bull_bear FROM event_analyses")
+        row = cur.fetchone()
+    assert row["model_version_bull_bear"] == "claude-haiku-4-5"
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +499,7 @@ def test_process_chunk_novelty_reasoning_reflects_prior_guidance_detection(conn)
     _seed_event(conn, "1", "TESTCO", dates[280].date())
 
     client = SimpleNamespace(messages=SimpleNamespace(batches=_ScriptedBatchesClient()))
-    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    conn = process_chunk(conn, client, fetch_events_needing_analysis(conn))
 
     with conn.cursor() as cur:
         cur.execute("SELECT novelty_reasoning FROM event_analyses ea JOIN events e ON e.event_id=ea.event_id WHERE e.d0_close_date = %s", (dates[280].date(),))
