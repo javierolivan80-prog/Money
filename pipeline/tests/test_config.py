@@ -26,6 +26,22 @@ import importlib
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restaurar_config():
+    """Deja pipeline.config como estaba al acabar cada test.
+
+    monkeypatch restaura os.environ, pero NO el módulo: tras un reload con
+    DATABASE_URL borrada, config.DATABASE_URL se quedaba en el default
+    'postgresql://localhost:5432/money_poc' para TODOS los tests que venían
+    después — y los 60+ tests de integración con Postgres fallaban con
+    'fe_sendauth: no password supplied'. Eso tumbó el job `test` de cada run
+    del Nightly Pipeline desde que se añadió este fichero, y con él todo el
+    pipeline (ingest_and_analyze depende de `test`)."""
+    yield
+    from pipeline import config
+    importlib.reload(config)
+
+
 def _recargar_config(monkeypatch, **env):
     """Reimporta pipeline.config con variables de entorno controladas — el
     módulo lee os.environ al importarse, así que hay que forzar la relectura
