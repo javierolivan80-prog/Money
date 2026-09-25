@@ -54,6 +54,15 @@ on:
         required: false
         default: ""
 
+# Nunca dos corridas a la vez. Un backfill manual de horas se solapaba con las
+# pasadas programadas: dos procesos escribiendo las mismas tablas y, peor, dos
+# procesos mandando los MISMOS eventos pendientes a la IA — pagando cada uno
+# dos veces. La corrida nueva espera a que acabe la anterior (no la cancela:
+# cancelar a mitad de un batch de la IA tira un trabajo ya pagado).
+concurrency:
+  group: nightly-pipeline
+  cancel-in-progress: false
+
 jobs:
   # Job separado para correr los tests contra un Postgres efímero de servicio,
   # en cada push Y antes de cada corrida nocturna — nunca se ingiere sobre un
@@ -74,10 +83,12 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
       - run: pip install -r pipeline/requirements.txt
       - name: Run test suite (incluye T1 placebo y T2 réplica — bloqueantes)
         env:
@@ -88,10 +99,12 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
       - run: pip install -r pipeline/requirements.txt
 
       - name: Aplicar schema (idempotente)
@@ -136,16 +149,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -c "
-          from pipeline.db.connection import get_connection
-          conn = get_connection()
-          with conn.cursor() as cur:
-              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
-              tickers = [r['ticker'] for r in cur.fetchall()]
-          with open('/tmp/tickers.txt', 'w') as f:
-              f.write('\n'.join(tickers))
-          print(f'{len(tickers)} tickers a descargar')
-          "
+          # Universo + series de referencia (SPY, ^VIX, ETFs sectoriales) que
+          # enrichment.py necesita para beta, VIX y sector_mood — antes nunca
+          # se descargaban y esos tres datos salían vacíos en todos los eventos.
+          python -m pipeline.ingest.universe_maintenance --tickers-file /tmp/tickers.txt
           # Rango de precios EXPLÍCITO, no el default del script
           # (config.BACKTEST_START/END, que termina en 2025-12-31 y dejaría sin
           # precios cualquier evento posterior a esa fecha). Hace falta:
@@ -180,16 +187,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -c "
-          from pipeline.db.connection import get_connection
-          conn = get_connection()
-          with conn.cursor() as cur:
-              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
-              tickers = [r['ticker'] for r in cur.fetchall()]
-          with open('/tmp/tickers.txt', 'w') as f:
-              f.write('\n'.join(tickers))
-          print(f'{len(tickers)} tickers en el universo')
-          " | tee /tmp/ticker_count.txt
+          # Universo + series de referencia (ver el paso de backfill).
+          python -m pipeline.ingest.universe_maintenance --tickers-file /tmp/tickers.txt
           if [ -s /tmp/tickers.txt ]; then
             PRICE_START=$(date -u -d "500 days ago" +%Y-%m-%d)
             PRICE_END=$(date -u +%Y-%m-%d)
@@ -206,7 +205,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
-        run: python -m pipeline.ingest.filing_text
+        # --limit 1000: con el default de 200, un backfill de ~25k eventos
+        # tardaba semanas en tener texto, y sin texto la IA no los analiza.
+        # A 8 req/s son ~2-3 minutos por pasada.
+        run: python -m pipeline.ingest.filing_text --limit 1000
 
       - name: Ingesta factores Fama-French (barato, se puede refrescar cada noche)
         env:
@@ -236,6 +238,17 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m pipeline.analyze.quality_score
 
+      - name: Lista de empresas — capitalización, liquidez y universo invertible
+        # Calcula universe.market_cap_last_usd / adv_usd_60d /
+        # in_investable_universe, que existían en el schema pero nunca se
+        # rellenaban. El análisis con IA de más abajo usa esto para priorizar
+        # empresas grandes y no gastar en micro-caps. Barato (una sentencia
+        # SQL): corre en todas las pasadas. --list 25 deja en el log las 25
+        # mayores y cuántos eventos tienen pendientes.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m pipeline.ingest.universe_maintenance --list 25
+
       - name: Calcular CAR de eventos pendientes (insumo de historical_analogues.py)
         # Sin este paso, analyze/historical_analogues.py siempre vería
         # n_analogues=0 — car_results no se llena solo (ver su docstring).
@@ -248,9 +261,22 @@ jobs:
         # que ya no escribe en la base de datos por sí solo — ahora es el
         # orquestador quien llama a Bull/Bear/Judge y combina el resultado con
         # enrichment/novelty/impact/EV/abstention antes de guardar en event_analyses.
+        #
+        # Sin saldo en la cuenta de Anthropic, el paso NO falla: deja un aviso
+        # (::warning::) con cuántos eventos esperan en cola y cuánto costarían,
+        # y la primera corrida con fondos los procesa sola.
+        #
+        # Palancas sin tocar código (Settings > Secrets and variables >
+        # Actions > Variables):
+        #   ANALYSIS_MIN_MARKET_CAP_USD — p. ej. 10000000000 para analizar
+        #     solo empresas de más de 10.000 M$ (por defecto, 300 M$).
+        #   ANALYSIS_MAX_EVENTS_PER_RUN — tope de gasto por corrida
+        #     (por defecto 500 eventos, ~5,5 $).
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANALYSIS_MIN_MARKET_CAP_USD: ${{ vars.ANALYSIS_MIN_MARKET_CAP_USD }}
+          ANALYSIS_MAX_EVENTS_PER_RUN: ${{ vars.ANALYSIS_MAX_EVENTS_PER_RUN }}
         run: python -m pipeline.analyze.event_analysis_pipeline
 
       # Estos tres pasos NO usan la IA: trabajan sobre lo que ya hay en la base
@@ -309,23 +335,19 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.backfill_start == ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
       - run: pip install -r pipeline/requirements.txt
       - name: Backfill de precios (universo desde la tabla universe)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python -c "
-          from pipeline.db.connection import get_connection
-          conn = get_connection()
-          with conn.cursor() as cur:
-              cur.execute('SELECT DISTINCT ticker FROM universe WHERE ticker IS NOT NULL')
-              tickers = [r['ticker'] for r in cur.fetchall()]
-          with open('/tmp/tickers.txt', 'w') as f:
-              f.write('\n'.join(tickers))
-          print(f'{len(tickers)} tickers a descargar')
-          "
+          # Universo + series de referencia (SPY, ^VIX, ETFs sectoriales) que
+          # enrichment.py necesita para beta, VIX y sector_mood — antes nunca
+          # se descargaban y esos tres datos salían vacíos en todos los eventos.
+          python -m pipeline.ingest.universe_maintenance --tickers-file /tmp/tickers.txt
           python -m pipeline.ingest.yfinance_backfill --tickers /tmp/tickers.txt
