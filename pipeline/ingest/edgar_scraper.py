@@ -34,6 +34,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from pipeline import config
 from pipeline.ingest.edgar_http import throttled_get, throttled_get_header
@@ -319,12 +320,39 @@ def compute_d0_close_date(filed_at: datetime) -> date:
     (campo "ACCEPTANCE-DATETIME"), no en el .idx. Este cálculo asume que
     `filed_at` ya viene en hora ET — responsabilidad del caller.
     """
+    from pipeline.ingest.market_calendar import festivos_del_anio
+
     d = filed_at.date()
     if filed_at.hour >= 16:
         d += timedelta(days=1)
-    while d.weekday() >= 5:  # sábado=5, domingo=6
+    # Fin de semana Y festivos de bolsa: un 8-K del Jueves Santo por la tarde
+    # no es público "al cierre" de un Viernes Santo en que la bolsa no abre.
+    while d.weekday() >= 5 or d in festivos_del_anio(d.year):
         d += timedelta(days=1)
     return d
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+def parse_acceptance_datetime(header_text: str) -> datetime | None:
+    """Hora REAL de aceptación del filing, en ET, desde la cabecera SGML
+    (<ACCEPTANCE-DATETIME>20240315161234). None si no aparece.
+
+    Sin esto, filed_at salía de la fecha del daily-index (medianoche), así que
+    la regla "después de las 16:00 ET, D0 pasa al día siguiente" de
+    compute_d0_close_date NUNCA se aplicaba: la mayoría de resultados
+    trimestrales se publican tras el cierre, y su D0 quedaba un día antes de
+    la reacción real del mercado — el salto del anuncio caía dentro de la
+    ventana "post-evento" del CAR.
+    """
+    m = re.search(r"<ACCEPTANCE-DATETIME>\s*(\d{14})", header_text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=_ET)
+    except ValueError:
+        return None
 
 
 def scrape_day(day: date) -> list[RawFiling]:
@@ -374,7 +402,9 @@ def scrape_day(day: date) -> list[RawFiling]:
             sin_clase += 1
             continue  # ninguna clase relevante, se descarta (no es data loss: es scope)
         raw_hash = hashlib.sha256(f"{accession}:{sorted(item_codes)}".encode()).hexdigest()
-        filed_at = datetime.strptime(row["date_filed"], "%Y-%m-%d")
+        filed_at = parse_acceptance_datetime(header_text) or datetime.strptime(
+            row["date_filed"], "%Y-%m-%d"
+        ).replace(tzinfo=_ET)
         filings.append(
             RawFiling(
                 accession_number=accession,

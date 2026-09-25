@@ -45,6 +45,33 @@ EDGAR_BASE = "https://www.sec.gov"
 MIN_PRICE_USD = 5.0
 MIN_MARKET_CAP_USD = 300_000_000
 MIN_ADV_USD = 1_000_000
+# Un precio más viejo que esto no cuenta para decidir si la empresa es
+# invertible HOY (deslistadas, tickers que yfinance dejó de servir...).
+MAX_PRICE_STALENESS_DAYS = 10
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    return float(raw) if raw else default
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    raw = (os.environ.get(name) or "").strip()
+    return int(raw) if raw else default
+
+
+# --- Cola del análisis con IA (Bull/Bear/Judge) ---
+# Qué empresas pasan por la IA. Por defecto, el universo invertible entero
+# (>= MIN_MARKET_CAP_USD). Para centrarse en empresas grandes, subirlo desde
+# un secreto/variable del workflow, sin tocar código — p. ej. 10000000000
+# (10.000 M$, "large caps").
+ANALYSIS_MIN_MARKET_CAP_USD = _env_float("ANALYSIS_MIN_MARKET_CAP_USD", MIN_MARKET_CAP_USD)
+# Tope de eventos analizados por corrida: es un tope de GASTO. Con los precios
+# de la Batch API (-50%), un evento cuesta ~0,011 $ (2 llamadas Haiku 4.5 +
+# 1 Sonnet 4.6 sobre ~8.000 caracteres de filing): 500 eventos ~ 5,5 $/corrida.
+# Vacío o 0 = sin tope.
+ANALYSIS_MAX_EVENTS_PER_RUN = _env_int("ANALYSIS_MAX_EVENTS_PER_RUN", 500) or None
+ANALYSIS_EST_COST_PER_EVENT_USD = 0.011
 
 # --- Ventanas de evento (ARCHITECTURE_LEAN.md §3, §5) ---
 ESTIMATION_WINDOW_DAYS = (-250, -30)

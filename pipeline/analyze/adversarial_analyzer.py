@@ -104,6 +104,12 @@ del debate.
 """
 
 CACHE_WINDOW_HOURS = 24
+# Distancia máxima entre el D0 del evento en caché y el del evento nuevo. Sin
+# este tope, `as_of` no se usaba: en un backfill (todo analizado en la misma
+# corrida, dentro de las mismas 24h de reloj) TODOS los resultados trimestrales
+# de 5 años de una empresa recibían el Bull/Bear/Judge del primero que se
+# analizó — veinte informes distintos con un único veredicto.
+CACHE_MAX_D0_GAP_DAYS = 1
 
 
 @dataclass
@@ -193,10 +199,15 @@ def build_judge_batch(events: list[EventContext], bull_bear_results: dict[str, d
     return requests_
 
 
-def run_batch_and_collect(client, requests_) -> tuple[dict[str, dict], str]:
+def run_batch_and_collect(client, requests_) -> tuple[dict[str, dict], str | None]:
     """Envía un batch, espera a que termine, y devuelve ({custom_id: parsed_json}, batch_id).
     Errores de validación o servidor se registran y se omiten (no abortan el
     batch entero)."""
+    if not requests_:
+        # Pasa cuando TODOS los Bull/Bear de un chunk fallan: el Judge se
+        # queda sin nada que arbitrar. La API rechaza un batch vacío con un
+        # 400, que tumbaba la corrida entera en vez de solo ese chunk.
+        return {}, None
     batch = client.messages.batches.create(requests=requests_)
     logger.info("Batch creado: %s (%d requests)", batch.id, len(requests_))
 
@@ -234,6 +245,11 @@ def get_cached_analysis(conn, ticker: str, event_class: str, as_of: date, within
     mismo (ticker, event_class) es una aproximación deliberada: el spec la
     pide explícitamente, aceptando que Bull/Bear/Judge pueden no ser
     idénticos evento a evento dentro de esa ventana.
+
+    Además, el evento en caché tiene que ser del MISMO episodio: su D0 entre
+    `as_of - CACHE_MAX_D0_GAP_DAYS` y `as_of`. Nunca posterior a `as_of` —
+    reutilizar el análisis de un filing más nuevo para uno más viejo sería
+    look-ahead.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -242,10 +258,12 @@ def get_cached_analysis(conn, ticker: str, event_class: str, as_of: date, within
             JOIN events e ON e.event_id = ea.event_id
             WHERE e.ticker = %(ticker)s AND e.event_class = %(event_class)s
               AND ea.analyzed_at >= now() - (%(hours)s || ' hours')::interval
+              AND e.d0_close_date BETWEEN %(as_of)s::date - %(gap)s AND %(as_of)s::date
             ORDER BY ea.analyzed_at DESC
             LIMIT 1
             """,
-            {"ticker": ticker, "event_class": event_class, "hours": within_hours},
+            {"ticker": ticker, "event_class": event_class, "hours": within_hours,
+             "as_of": as_of, "gap": CACHE_MAX_D0_GAP_DAYS},
         )
         return cur.fetchone()
 

@@ -264,10 +264,10 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
     process_chunk(conn, client, fetch_events_needing_analysis(conn))
     assert scripted_client.call_count == 2  # una llamada para bull/bear, otra para judge
 
-    # Segundo evento: mismo ticker, misma clase, fecha distinta (pero con
-    # suficiente historial de precios) -> debe reusar Bull/Bear/Judge de caché
+    # Segundo evento: mismo ticker, misma clase, al día hábil siguiente (mismo
+    # episodio, p. ej. una corrección) -> debe reusar Bull/Bear/Judge de caché
     # y NO generar nuevas llamadas al cliente.
-    _seed_event(conn, "1", "TESTCO", dates[290].date())
+    _seed_event(conn, "1", "TESTCO", dates[281].date())
     process_chunk(conn, client, fetch_events_needing_analysis(conn))
 
     assert scripted_client.call_count == 2  # sin llamadas nuevas: se sirvió de caché
@@ -278,6 +278,21 @@ def test_process_chunk_second_event_same_ticker_class_uses_cache_not_llm(conn):
     assert rows[0]["from_cache"] is False
     assert rows[1]["from_cache"] is True
     assert float(rows[1]["net_conviction"]) == pytest.approx(float(rows[0]["net_conviction"]))
+
+
+def test_process_chunk_otro_trimestre_del_mismo_ticker_no_usa_cache(conn):
+    """Dos semanas después ya es otro filing: reutilizar el veredicto del
+    anterior daría a todos los trimestres de una empresa la misma opinión."""
+    from pipeline.analyze.event_analysis_pipeline import fetch_events_needing_analysis, process_chunk
+
+    dates = _seed_market_data(conn, [("TESTCO", 50.0), ("SPY", 400.0), ("XLV", 100.0), ("^VIX", 18.0)])
+    _seed_event(conn, "1", "TESTCO", dates[280].date())
+    scripted_client = _ScriptedBatchesClient()
+    client = SimpleNamespace(messages=SimpleNamespace(batches=scripted_client))
+    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    _seed_event(conn, "1", "TESTCO", dates[290].date())
+    process_chunk(conn, client, fetch_events_needing_analysis(conn))
+    assert scripted_client.call_count == 4
 
 
 # ---------------------------------------------------------------------------

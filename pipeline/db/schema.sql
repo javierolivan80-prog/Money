@@ -82,6 +82,11 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_length_chars INT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_includes_exhibit BOOLEAN;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_extracted_at TIMESTAMPTZ;
+-- Intentos fallidos de extracción (descarga caída, 404, texto vacío). Sin
+-- esto, los que fallaban siempre se quedaban los primeros de la cola (ORDER BY
+-- event_id LIMIT n) y, en cuanto se juntaban n, ningún evento nuevo recibía
+-- texto nunca más. Tras MAX_ATTEMPTS se dejan de reintentar.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS filing_text_attempts INT NOT NULL DEFAULT 0;
 
 -- ============================================================================
 -- prices: panel diario. close_raw + adj_factor separados a propósito (ver cabecera).

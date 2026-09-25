@@ -120,10 +120,20 @@ class _FakeBatchesClient:
 
 def test_run_batch_and_collect_skips_errored_results():
     client = SimpleNamespace(messages=SimpleNamespace(batches=_FakeBatchesClient()))
-    results, batch_id = run_batch_and_collect(client, requests_=[])
+    results, batch_id = run_batch_and_collect(client, requests_=[{"custom_id": "1:judge"}])
     assert batch_id == "batch_test123"
     assert set(results.keys()) == {"1:judge"}
     assert results["1:judge"]["net_conviction"] == 0.6
+
+
+def test_run_batch_and_collect_sin_requests_no_crea_batch():
+    """La API rechaza un batch vacío con un 400: no se debe ni intentar."""
+    class _NoDebeLlamarse:
+        def create(self, requests):
+            raise AssertionError("se creó un batch vacío")
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_NoDebeLlamarse()))
+    assert run_batch_and_collect(client, requests_=[]) == ({}, None)
 
 
 # ---------------------------------------------------------------------------
@@ -187,18 +197,27 @@ class TestCacheAgainstRealPostgres:
 
     def test_cache_hit_within_24h_window(self):
         self._insert_event_with_analysis("1", "ACME", "8K_2.02_EARNINGS", "2 hours")
-        cached = get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date.today())
+        cached = get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 1, 1))
         assert cached is not None
         assert cached["net_conviction"] == pytest.approx(0.5)
 
     def test_cache_miss_outside_24h_window(self):
         self._insert_event_with_analysis("2", "ACME", "8K_2.02_EARNINGS", "25 hours")
-        cached = get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date.today())
+        cached = get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 1, 1))
         assert cached is None
 
     def test_cache_is_scoped_to_ticker_and_event_class(self):
         self._insert_event_with_analysis("3", "ACME", "8K_2.02_EARNINGS", "1 hour")
         # Mismo ticker, distinta clase de evento -> no debe dar cache hit.
-        assert get_cached_analysis(self.conn, "ACME", "8K_1.01_MATERIAL_AGMT", date.today()) is None
+        assert get_cached_analysis(self.conn, "ACME", "8K_1.01_MATERIAL_AGMT", date(2024, 1, 1)) is None
         # Misma clase, distinto ticker -> tampoco.
-        assert get_cached_analysis(self.conn, "OTHER", "8K_2.02_EARNINGS", date.today()) is None
+        assert get_cached_analysis(self.conn, "OTHER", "8K_2.02_EARNINGS", date(2024, 1, 1)) is None
+
+    def test_cache_no_reutiliza_otro_episodio_del_mismo_ticker(self):
+        """Evento en caché con D0 2024-01-01: sirve para uno del día siguiente
+        (mismo episodio), no para uno tres meses después (otro trimestre), ni
+        para uno ANTERIOR (sería usar un filing del futuro)."""
+        self._insert_event_with_analysis("4", "ACME", "8K_2.02_EARNINGS", "1 hour")
+        assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 1, 2)) is not None
+        assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 4, 1)) is None
+        assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2023, 12, 31)) is None

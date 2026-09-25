@@ -20,7 +20,16 @@ export function getPool(): Pool {
     );
   }
   if (!pool) {
-    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    pool = new Pool({
+      // trim(): el mismo fallo que ya tumbó el pipeline dos veces (ver
+      // pipeline/config.py) — un secreto pegado con un salto de línea final.
+      connectionString: process.env.DATABASE_URL.trim(),
+      // En Vercel cada instancia serverless abre su propio pool; sin tope,
+      // unas pocas visitas simultáneas agotan las conexiones del plan
+      // gratuito de Neon/Supabase. Las páginas hacen pocas consultas cada una.
+      max: 3,
+      idleTimeoutMillis: 10_000,
+    });
   }
   return pool;
 }

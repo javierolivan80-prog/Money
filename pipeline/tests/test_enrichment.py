@@ -230,3 +230,22 @@ def test_fetch_and_compute_enrichment_end_to_end_against_real_postgres():
     assert result.beta_vs_spy is not None
     assert result.vix_d0 == pytest.approx(18.0, abs=2.0)
     conn.close()
+
+
+def test_compute_enrichment_sin_factores_ni_precios_no_revienta():
+    """Antes: TypeError/KeyError después de pagar la IA. Ahora: todo None."""
+    import pandas as pd
+
+    from pipeline.analyze.enrichment import compute_enrichment
+
+    vacio = pd.DataFrame()
+    r = compute_enrichment(vacio, vacio, vacio, vacio, vacio, date(2024, 3, 15), "SPY")
+    assert r.price_d0 is None
+    assert r.beta_vs_spy is None
+    assert r.n_estimation_days == 0
+
+
+def test_benchmark_tickers_incluye_spy_vix_y_sectores():
+    from pipeline.analyze.enrichment import BENCHMARK_TICKERS
+
+    assert {"SPY", "^VIX", "XLK", "XLV", "XLF"} <= set(BENCHMARK_TICKERS)
