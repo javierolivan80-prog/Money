@@ -52,22 +52,32 @@ def _load_factor_returns(conn) -> pd.DataFrame:
     return df.set_index("trade_date").astype(float)
 
 
-def populate_missing_car_results(conn, limit: int = 1000) -> int:
+def _pending_page(conn, after_event_id: int, limit: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT e.event_id, e.ticker, e.d0_close_date
             FROM events e
             LEFT JOIN car_results cr ON cr.event_id = e.event_id AND cr.window_days = 20
-            WHERE cr.event_id IS NULL
+            WHERE cr.event_id IS NULL AND e.event_id > %s
             ORDER BY e.event_id
             LIMIT %s
             """,
-            (limit,),
+            (after_event_id, limit),
         )
-        pending = cur.fetchall()
+        return cur.fetchall()
 
-    if not pending:
+
+def populate_missing_car_results(conn, limit: int = 1000) -> int:
+    """Recorre TODOS los eventos sin CAR, en páginas de `limit`.
+
+    Antes solo miraba los `limit` primeros por event_id. Los eventos cuyo CAR
+    no se puede calcular (sin precios, deslistados, ventana aún abierta) se
+    quedan pendientes para siempre, y en cuanto se juntaban 1000 al principio
+    de la cola, ningún evento nuevo recibía CAR nunca más: los análogos
+    históricos (Etapa 6) se congelaban sin ningún error visible.
+    """
+    if not _pending_page(conn, 0, 1):
         return 0
 
     factor_returns = _load_factor_returns(conn)
@@ -77,6 +87,19 @@ def populate_missing_car_results(conn, limit: int = 1000) -> int:
 
     stored = 0
     ticker_cache: dict[str, pd.DataFrame] = {}
+    last_id = 0
+    while True:
+        pending = _pending_page(conn, last_id, limit)
+        if not pending:
+            break
+        last_id = pending[-1]["event_id"]
+        stored += _compute_page(conn, pending, factor_returns, ticker_cache)
+        conn.commit()
+    return stored
+
+
+def _compute_page(conn, pending: list[dict], factor_returns: pd.DataFrame, ticker_cache: dict) -> int:
+    stored = 0
     for row in pending:
         ticker = row["ticker"]
         if ticker not in ticker_cache:
@@ -101,7 +124,6 @@ def populate_missing_car_results(conn, limit: int = 1000) -> int:
                     (row["event_id"], window_days, result.car, result.abnormal_volume_ratio, result.n_estimation_days),
                 )
             stored += 1
-    conn.commit()
     return stored
 
 

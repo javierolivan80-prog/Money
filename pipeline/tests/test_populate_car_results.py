@@ -109,3 +109,30 @@ def test_populate_skips_events_without_enough_price_history(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM car_results cr JOIN events e ON e.event_id=cr.event_id WHERE e.ticker='SHORTCO'")
         assert cur.fetchone()["n"] == 0
+
+
+def test_eventos_sin_car_posible_no_bloquean_a_los_nuevos(conn):
+    """Regresión: con limit=1 y un evento sin precios delante (CAR imposible
+    para siempre), antes el evento evaluable de detrás no recibía CAR nunca."""
+    from pipeline.backtest.populate_car_results import populate_missing_car_results
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO universe (cik, ticker, company_name, first_seen_date, last_seen_date) "
+            "VALUES ('9','GHOST','Sin precios','2021-01-01','2021-01-01')"
+        )
+        cur.execute(
+            """
+            INSERT INTO events (cik, ticker, source, is_satellite, event_class, item_codes,
+                accession_number, source_url, filed_at, d0_close_date, classification_method,
+                classification_confidence, raw_text_hash)
+            VALUES ('9','GHOST','EDGAR',FALSE,'8K_2.02_EARNINGS',ARRAY['2.02'],'acc0','https://x',
+                    '2021-06-01','2021-06-01','RULE',1.0,'h0')
+            """
+        )
+    conn.commit()
+    event_id = _seed(conn)
+    assert populate_missing_car_results(conn, limit=1) == 2
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM car_results WHERE event_id = %s", (event_id,))
+        assert cur.fetchone()["n"] == 2

@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # común, pero una empresa puede nombrar su exhibit de otra forma.
 _PRESS_RELEASE_EXHIBIT_PREFIX = "EX-99"
 
+MAX_ATTEMPTS = 3  # intentos fallidos antes de dejar un evento sin texto para siempre
 MAX_TEXT_CHARS = 8000  # tope de longitud guardada — controla coste de prompt en Bull/Bear/Judge
 
 
@@ -139,13 +140,24 @@ def populate_missing_filing_text(conn, limit: int = 200) -> int:
     no tienen un submission .txt de EDGAR que descargar, y el scraper de FDA
     sigue sin construirse (RUNBOOK.md), así que su filing_text queda NULL
     hasta que exista esa fuente."""
+    # Más recientes primero: son los que la IA y el paper trading necesitan
+    # YA; el histórico se completa en las pasadas siguientes.
     with conn.cursor() as cur:
         cur.execute(
             "SELECT event_id, source_url, event_class FROM events "
-            "WHERE source = 'EDGAR' AND filing_text IS NULL ORDER BY event_id LIMIT %s",
-            (limit,),
+            "WHERE source = 'EDGAR' AND filing_text IS NULL AND filing_text_attempts < %s "
+            "ORDER BY d0_close_date DESC, event_id DESC LIMIT %s",
+            (MAX_ATTEMPTS, limit),
         )
         pending = cur.fetchall()
+
+    def _fallo(event_id: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE events SET filing_text_attempts = filing_text_attempts + 1 WHERE event_id = %s",
+                (event_id,),
+            )
+        conn.commit()
 
     count = 0
     for row in pending:
@@ -153,9 +165,11 @@ def populate_missing_filing_text(conn, limit: int = 200) -> int:
             result = fetch_filing_text(row["source_url"], row["event_class"])
         except RuntimeError:
             logger.exception("No se pudo descargar el filing del evento %d — se omite", row["event_id"])
+            _fallo(row["event_id"])
             continue
         if not result["text"]:
             logger.warning("Evento %d: texto extraído vacío", row["event_id"])
+            _fallo(row["event_id"])
             continue
         with conn.cursor() as cur:
             cur.execute(

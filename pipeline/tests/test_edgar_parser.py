@@ -340,3 +340,35 @@ def test_compute_d0_close_date_never_lands_on_weekend_or_before_filing(filed_at,
     assert result == expected
     assert result.weekday() < 5
     assert result >= filed_at.date()  # D0 nunca es anterior al día de presentación
+
+
+# --- Hora real de aceptación y festivos (D0) ---
+
+from pipeline.ingest.edgar_scraper import parse_acceptance_datetime  # noqa: E402
+
+
+def test_parse_acceptance_datetime_lee_la_hora_et_de_la_cabecera():
+    header = (FIXTURES / "sample_8k_header_numeric.txt").read_text()
+    dt = parse_acceptance_datetime(header)
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day, dt.hour, dt.minute) == (2024, 3, 15, 16, 12)
+    assert str(dt.tzinfo) == "America/New_York"
+
+
+def test_parse_acceptance_datetime_sin_campo_devuelve_none():
+    assert parse_acceptance_datetime("<SEC-HEADER>\nACCESSION NUMBER: x\n</SEC-HEADER>") is None
+
+
+def test_filing_tras_el_cierre_de_un_viernes_tiene_d0_el_lunes():
+    """El caso que se perdía con filed_at a medianoche: resultados publicados
+    a las 16:12 ET de un viernes. D0 es el lunes, no el viernes."""
+    header = (FIXTURES / "sample_8k_header_numeric.txt").read_text()
+    assert compute_d0_close_date(parse_acceptance_datetime(header)) == date(2024, 3, 18)
+
+
+def test_d0_salta_festivos_de_bolsa():
+    # Jueves 2024-03-28 a las 17:00 ET -> viernes 29 es Viernes Santo (NYSE
+    # cerrado) -> D0 es el lunes 1 de abril.
+    assert compute_d0_close_date(datetime(2024, 3, 28, 17, 0)) == date(2024, 4, 1)
+    # Filing en pleno 4 de julio (jueves) -> D0 el viernes 5.
+    assert compute_d0_close_date(datetime(2024, 7, 4, 10, 0)) == date(2024, 7, 5)

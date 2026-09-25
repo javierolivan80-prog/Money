@@ -213,3 +213,43 @@ class TestPopulateAgainstRealPostgres:
         self._seed_event(event_class="FDA_CRL", source="FDA_OPENFDA")
         n = populate_missing_filing_text(self.conn)
         assert n == 0  # no hay scraper de FDA todavía — se salta explícitamente
+
+    def test_un_filing_que_falla_siempre_no_bloquea_la_cola(self, monkeypatch):
+        """Regresión: con limit=1 y el primer evento fallando siempre, antes
+        el segundo no recibía texto nunca. Ahora el fallido se aparta tras
+        MAX_ATTEMPTS y el nuevo se procesa (además va primero por ser más
+        reciente)."""
+        from pipeline.ingest import filing_text
+
+        malo = self._seed_event()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO events (cik, ticker, source, is_satellite, event_class, item_codes,
+                    accession_number, source_url, filed_at, d0_close_date, classification_method,
+                    classification_confidence, raw_text_hash)
+                VALUES ('1','ACME','EDGAR',FALSE,'8K_2.02_EARNINGS',ARRAY['2.02'],'acc2','https://www.sec.gov/ok',
+                        '2024-06-14','2024-06-14','RULE',1.0,'h2')
+                RETURNING event_id
+                """
+            )
+            bueno = cur.fetchone()["event_id"]
+        self.conn.commit()
+
+        fixture_text = (FIXTURES / "sample_8k_multidoc.txt").read_text()
+
+        def _get(url, **kw):
+            if url.endswith("/x"):
+                raise RuntimeError("404 permanente")
+            return type("R", (), {"text": fixture_text})()
+
+        monkeypatch.setattr("pipeline.ingest.filing_text.throttled_get", _get)
+        assert filing_text.populate_missing_filing_text(self.conn, limit=1) == 1  # el reciente primero
+        for _ in range(filing_text.MAX_ATTEMPTS):
+            filing_text.populate_missing_filing_text(self.conn, limit=1)
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT event_id, filing_text IS NOT NULL AS ok, filing_text_attempts FROM events ORDER BY event_id")
+            rows = {r["event_id"]: r for r in cur.fetchall()}
+        assert rows[bueno]["ok"] is True
+        assert rows[malo]["filing_text_attempts"] == filing_text.MAX_ATTEMPTS
+        assert filing_text.populate_missing_filing_text(self.conn, limit=1) == 0  # ya no se reintenta
