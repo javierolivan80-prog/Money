@@ -48,6 +48,13 @@ _SIC_PREFIX_TO_ETF = {
 }
 DEFAULT_SECTOR_ETF = "SPY"  # sin mapeo conocido: sector_mood degrada a ~0, no revienta
 
+# Series de referencia que este módulo lee de `prices` y que NO son empresas
+# del universo: si no se descargan explícitamente, nunca llegan (el backfill
+# de yfinance del workflow solo baja los tickers de `universe`), y beta,
+# vix_d0 y sector_mood salen vacíos para TODOS los eventos. El workflow las
+# añade a la lista de descarga importando esta constante.
+BENCHMARK_TICKERS = sorted({"SPY", "^VIX", DEFAULT_SECTOR_ETF, *_SIC_PREFIX_TO_ETF.values()})
+
 
 def sic_to_sector_etf(sic_code: str | None) -> str:
     if not sic_code or len(sic_code) < 2:
@@ -114,6 +121,16 @@ def compute_enrichment(
     fetch_and_compute_enrichment para el ensamblado real desde Postgres).
     """
     d0_ts = pd.Timestamp(d0_close_date)
+    if ticker_prices.empty:
+        # Ticker sin ningún precio todavía (p. ej. recién aparecido en una
+        # pasada intradía, antes del backfill nocturno). Antes: KeyError
+        # DESPUÉS de haber pagado Bull/Bear/Judge, y vuelta a pagar la noche
+        # siguiente. Ahora: todo None, que abstention_engine ya trata como
+        # "no evaluable".
+        ticker_prices = pd.DataFrame(
+            columns=["close_raw", "high_raw", "low_raw", "adj_factor", "volume", "survivorship_warning"],
+            index=pd.DatetimeIndex([], name="trade_date"),
+        )
     adj_close = _adjusted_close(ticker_prices)
 
     price_d0 = _nearest_at_or_before(adj_close, d0_ts)
@@ -146,10 +163,15 @@ def compute_enrichment(
         had_survivorship_warning = True
 
     # Beta / exposición a factores: reutiliza el ajuste compartido con compute_car.
-    merged = ticker_prices.copy()
-    merged["ret"] = adj_close.pct_change()
-    merged = merged.join(factor_returns, how="inner")
-    fit = fit_factor_model(merged, d0_close_date)
+    fit = None
+    if not ticker_prices.empty and not factor_returns.empty:
+        # Sin factores (descarga de Ken French caída esa noche) el join deja un
+        # índice sin tipo fecha y fit_factor_model revienta comparándolo con
+        # un Timestamp. Sin factores no hay beta: None, no una excepción.
+        merged = ticker_prices.copy()
+        merged["ret"] = adj_close.pct_change()
+        merged = merged.join(factor_returns, how="inner")
+        fit = fit_factor_model(merged, d0_close_date)
     beta_vs_spy = fit.beta_mkt if fit else None
     ff_size_exposure = fit.beta_smb if fit else None
     ff_value_exposure = fit.beta_hml if fit else None

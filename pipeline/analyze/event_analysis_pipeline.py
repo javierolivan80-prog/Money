@@ -55,22 +55,84 @@ CHUNK_SIZE = 50
 FDA_CRL_8K_WINDOW_DAYS = 10  # ventana de tolerancia para buscar un 8-K correspondiente
 
 
-def fetch_events_needing_analysis(conn, limit: int = CHUNK_SIZE) -> list[dict]:
+def _queue_filters(min_market_cap: float | None, require_text: bool, exclude_ids) -> tuple[str, dict]:
+    where = ["ea.event_id IS NULL"]
+    params: dict = {}
+    if min_market_cap is not None:
+        # Solo el universo invertible, y a partir de cierto tamaño: es la
+        # palanca para gastar la IA en empresas grandes primero.
+        where.append("u.in_investable_universe AND u.market_cap_last_usd >= %(min_cap)s")
+        params["min_cap"] = min_market_cap
+    if require_text:
+        # Un evento de EDGAR sin texto extraído todavía NO se manda a la IA:
+        # Bull/Bear/Judge sobre el placeholder es pagar por ruido. Se analiza
+        # en la pasada siguiente, cuando filing_text.py lo haya descargado.
+        where.append("(e.source <> 'EDGAR' OR e.filing_text IS NOT NULL)")
+    if exclude_ids:
+        where.append("NOT (e.event_id = ANY(%(exclude)s))")
+        params["exclude"] = list(exclude_ids)
+    return " AND ".join(where), params
+
+
+def fetch_events_needing_analysis(
+    conn,
+    limit: int = CHUNK_SIZE,
+    *,
+    min_market_cap: float | None = None,
+    require_text: bool = False,
+    exclude_ids=(),
+) -> list[dict]:
+    """Siguiente tanda de la cola. Sin filtros (los defaults) devuelve todo lo
+    pendiente en orden de event_id; run_pipeline() la llama con los filtros
+    de config: más recientes primero y, a igualdad de fecha, las empresas más
+    grandes primero."""
+    where, params = _queue_filters(min_market_cap, require_text, exclude_ids)
+    order = (
+        "e.d0_close_date DESC, u.market_cap_last_usd DESC NULLS LAST, e.event_id"
+        if min_market_cap is not None
+        else "e.event_id"
+    )
+    params["limit"] = limit
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT e.event_id, e.cik, e.ticker, e.event_class, e.source, e.d0_close_date,
                    e.filing_text, u.company_name, u.sic_code
             FROM events e
             JOIN universe u ON u.cik = e.cik
             LEFT JOIN event_analyses ea ON ea.event_id = e.event_id
-            WHERE ea.event_id IS NULL
-            ORDER BY e.event_id
-            LIMIT %s
+            WHERE {where}
+            ORDER BY {order}
+            LIMIT %(limit)s
             """,
-            (limit,),
+            params,
         )
         return cur.fetchall()
+
+
+def analysis_queue_summary(conn, min_market_cap: float | None = None) -> dict:
+    """Cuántos eventos esperan a la IA y cuánto costaría analizarlos — para que
+    el log de cada corrida diga qué hay listo aunque la clave no tenga saldo."""
+    min_market_cap = config.ANALYSIS_MIN_MARKET_CAP_USD if min_market_cap is None else min_market_cap
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS pendientes,
+                   count(*) FILTER (WHERE u.in_investable_universe AND u.market_cap_last_usd >= %(min_cap)s) AS en_objetivo,
+                   count(*) FILTER (WHERE u.in_investable_universe AND u.market_cap_last_usd >= %(min_cap)s
+                                    AND (e.source <> 'EDGAR' OR e.filing_text IS NOT NULL)) AS listos,
+                   count(DISTINCT e.cik) FILTER (WHERE u.in_investable_universe AND u.market_cap_last_usd >= %(min_cap)s) AS empresas
+            FROM events e
+            JOIN universe u ON u.cik = e.cik
+            LEFT JOIN event_analyses ea ON ea.event_id = e.event_id
+            WHERE ea.event_id IS NULL
+            """,
+            {"min_cap": min_market_cap},
+        )
+        row = dict(cur.fetchone())
+    row["min_market_cap_usd"] = min_market_cap
+    row["coste_estimado_listos_usd"] = round(row["listos"] * config.ANALYSIS_EST_COST_PER_EVENT_USD, 2)
+    return row
 
 
 def check_fda_crl_without_8k(conn, cik: str, event_class: str, d0_close_date: date) -> bool:
@@ -286,21 +348,52 @@ def _store_event_analysis(conn, event_id, novelty, bull_output, bear_output, jud
     conn.commit()
 
 
-def run_pipeline(conn, client, max_chunks: int | None = None) -> int:
-    """Bucle principal: procesa hasta que no queden eventos pendientes.
+def run_pipeline(
+    conn,
+    client,
+    max_chunks: int | None = None,
+    *,
+    max_events: int | None = None,
+    min_market_cap: float | None = None,
+    require_text: bool = False,
+) -> int:
+    """Bucle principal: procesa hasta que no queden eventos pendientes, o
+    hasta el tope de eventos (tope de gasto).
     Devuelve el nº total de eventos procesados (con éxito o con error
     individual — un fallo por evento no cuenta como "no procesado" a efectos
-    del bucle, ya que _process_single_event ya lo atrapó y logueó)."""
+    del bucle, ya que _process_single_event ya lo atrapó y logueó).
+
+    Cada evento se intenta UNA vez por corrida. Antes, un evento cuyo
+    Bull/Bear/Judge volvía incompleto (request errored/expired, JSON inválido)
+    no se guardaba, así que la consulta siguiente lo devolvía otra vez, y
+    otra: un bucle infinito que además re-pagaba el batch en cada vuelta. Los
+    fallidos se reintentan en la corrida siguiente, no en esta."""
     total = 0
     chunks_done = 0
+    attempted: set[int] = set()
     while max_chunks is None or chunks_done < max_chunks:
-        batch = fetch_events_needing_analysis(conn, CHUNK_SIZE)
+        limit = CHUNK_SIZE if max_events is None else min(CHUNK_SIZE, max_events - total)
+        if limit <= 0:
+            logger.info("Tope de %d eventos por corrida alcanzado — el resto queda en cola", max_events)
+            break
+        batch = fetch_events_needing_analysis(
+            conn, limit, min_market_cap=min_market_cap, require_text=require_text, exclude_ids=attempted,
+        )
         if not batch:
             break
+        attempted.update(ev["event_id"] for ev in batch)
         process_chunk(conn, client, batch)
         total += len(batch)
         chunks_done += 1
     return total
+
+
+def _is_billing_error(exc: Exception) -> bool:
+    """400 de la API por saldo insuficiente ("Your credit balance is too low").
+    No es un bug del pipeline: es un estado de la cuenta."""
+    import anthropic
+
+    return isinstance(exc, anthropic.BadRequestError) and "credit balance" in str(exc).lower()
 
 
 def compute_day3_stats(conn) -> dict:
@@ -367,13 +460,41 @@ if __name__ == "__main__":
         )
 
     conn = get_connection()
+    cola = analysis_queue_summary(conn)
+    print(
+        f"Cola de la IA: {cola['pendientes']} eventos sin analizar; {cola['en_objetivo']} de "
+        f"{cola['empresas']} empresas >= {cola['min_market_cap_usd'] / 1e6:,.0f} M$; "
+        f"{cola['listos']} con texto y listos (~{cola['coste_estimado_listos_usd']} $). "
+        f"Tope por corrida: {config.ANALYSIS_MAX_EVENTS_PER_RUN or 'sin tope'}."
+    )
     # api_key EXPLÍCITO: ver la nota en adversarial_analyzer.py. Sin esto, el
     # chequeo de arriba puede pasar (la variable existe) y aun así reventar
     # más abajo si el secreto trae un salto de línea, porque la librería sin
     # argumentos lee la variable de entorno tal cual, no la ya limpiada.
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-    processed = run_pipeline(conn, client)
+    try:
+        processed = run_pipeline(
+            conn,
+            client,
+            max_events=config.ANALYSIS_MAX_EVENTS_PER_RUN,
+            min_market_cap=config.ANALYSIS_MIN_MARKET_CAP_USD,
+            require_text=True,
+        )
+    except Exception as exc:
+        if not _is_billing_error(exc):
+            raise
+        # Sin saldo: la cola queda intacta (nada se escribe sin respuesta de
+        # la IA) y se retoma sola la primera noche que la cuenta tenga fondos.
+        # Anotación ::warning:: para que se vea en el resumen del run de
+        # GitHub, pero sin tumbar el paso: no es un fallo del código.
+        print(
+            "::warning title=API de Anthropic sin saldo::La clave es válida pero la cuenta no tiene "
+            f"crédito. {cola['listos']} eventos siguen en cola, listos para analizarse "
+            f"(~{cola['coste_estimado_listos_usd']} $). Añade fondos en console.anthropic.com > Billing; "
+            "la siguiente corrida los procesará sin hacer nada más."
+        )
+        raise SystemExit(0)
     print(f"Procesados {processed} eventos")
 
     stats = compute_day3_stats(conn)
