@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -67,11 +68,21 @@ BEAR_SCHEMA = {
     "additionalProperties": False,
 }
 
+# SIN minimum/maximum: structured outputs NO admite restricciones numéricas
+# (minimum, maximum, multipleOf) ni de longitud (minLength, maxLength). Con
+# ellas en el esquema, la API marcaba `errored` TODAS las requests del Judge
+# (198/198 en el run 34964242549, 397/397 en el 34970097017) mientras
+# Bull/Bear —sin restricciones numéricas— salían bien: ni un solo evento llegó
+# a event_analyses. El rango se pide en la descripción y se VALIDA en Python
+# al recibir la respuesta (validar_salida_judge), no en el esquema.
+NET_CONVICTION_RANGE = (-1.0, 1.0)
+CONFIDENCE_RANGE = (0.0, 100.0)
+
 JUDGE_SCHEMA = {
     "type": "object",
     "properties": {
-        "net_conviction": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "-1 = Bear gana, 1 = Bull gana"},
-        "confidence_in_conviction": {"type": "number", "minimum": 0, "maximum": 100},
+        "net_conviction": {"type": "number", "description": "Entre -1 y 1: -1 = Bear gana, 1 = Bull gana"},
+        "confidence_in_conviction": {"type": "number", "description": "Entre 0 y 100"},
         "key_uncertainty": {"type": "string", "description": "¿Qué dato resolvería el debate?"},
         "overriding_concern": {"type": "string", "description": "Si algo anula a Bull o Bear, cuál es"},
     },
@@ -103,6 +114,39 @@ sé explícito sobre qué dato, de existir, resolvería la incertidumbre central
 del debate.
 """
 
+
+def _numero_en_rango(value, lo: float, hi: float) -> float | None:
+    # bool es subclase de int en Python: True pasaría como 1.0 si no se excluye.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if math.isnan(value) or not (lo <= value <= hi):
+        return None
+    return value
+
+
+def validar_salida_judge(output: dict | None, custom_id: str = "?") -> dict | None:
+    """Comprueba el rango que el esquema ya no puede imponer (ver JUDGE_SCHEMA).
+
+    Devuelve la salida con los dos números normalizados a float, o None si
+    falta alguno o está fuera de rango. Se RECHAZA, no se recorta: un -3 o un
+    150 dice que el modelo no entendió la escala, y recortarlo a -1 o 100
+    convertiría ese error en la convicción más fuerte posible — justo la que
+    más pesa en el EV y en la decisión de operar."""
+    if not isinstance(output, dict):
+        return None
+    conviction = _numero_en_rango(output.get("net_conviction"), *NET_CONVICTION_RANGE)
+    confidence = _numero_en_rango(output.get("confidence_in_conviction"), *CONFIDENCE_RANGE)
+    if conviction is None or confidence is None:
+        logger.warning(
+            "Judge %s descartado: net_conviction=%r (debe estar en %s) confidence_in_conviction=%r (debe estar en %s)",
+            custom_id, output.get("net_conviction"), NET_CONVICTION_RANGE,
+            output.get("confidence_in_conviction"), CONFIDENCE_RANGE,
+        )
+        return None
+    return {**output, "net_conviction": conviction, "confidence_in_conviction": confidence}
+
+
 CACHE_WINDOW_HOURS = 24
 # Distancia máxima entre el D0 del evento en caché y el del evento nuevo. Sin
 # este tope, `as_of` no se usaba: en un backfill (todo analizado en la misma
@@ -133,6 +177,28 @@ def _event_prompt(ctx: EventContext) -> str:
     return "\n".join(parts)
 
 
+def custom_id_de(event_id: int, side: str) -> str:
+    """El id de cada request dentro de un batch de la Batch API de Anthropic.
+
+    BUG REAL (2026-09-15, run 34960903955): se construía como
+    f"{event_id}:{side}", con dos puntos. La API los rechaza:
+
+        requests.0.custom_id: String should match pattern
+        '^[a-zA-Z0-9_-]{1,64}$'
+
+    y el batch entero fallaba con 400 antes de procesar una sola request —
+    el fallo estaba en la FORMA del identificador, no en su contenido, así
+    que no dependía de qué evento fuera. Con guion bajo en vez de dos puntos
+    entra dentro del patrón que exige la API.
+
+    Centralizado aquí porque el mismo formato se construye en tres sitios de
+    este módulo y se vuelve a parsear en otro más
+    (event_analysis_pipeline.py) — repetirlo a mano es la forma en que este
+    tipo de discrepancia vuelve a colarse.
+    """
+    return f"{event_id}_{side}"
+
+
 def build_bull_bear_batch(events: list[EventContext]):
     """2N requests por N eventos: una Bull, una Bear, cada una con su propio
     esquema JSON y su propio system prompt — ver docstring del módulo."""
@@ -147,7 +213,7 @@ def build_bull_bear_batch(events: list[EventContext]):
         ]:
             requests_.append(
                 Request(
-                    custom_id=f"{ctx.event_id}:{side}",
+                    custom_id=custom_id_de(ctx.event_id, side),
                     params=MessageCreateParamsNonStreaming(
                         model=config.ANALYZER_MODEL,
                         max_tokens=1024,
@@ -161,15 +227,15 @@ def build_bull_bear_batch(events: list[EventContext]):
 
 
 def build_judge_batch(events: list[EventContext], bull_bear_results: dict[str, dict]):
-    """bull_bear_results: {"<event_id>:bull": {...}, "<event_id>:bear": {...}}.
+    """bull_bear_results: {custom_id_de(event_id, "bull"): {...}, custom_id_de(event_id, "bear"): {...}}.
     Modelo: config.JUDGE_MODEL (claude-sonnet-4-6, pedido explícito por el spec)."""
     from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
     from anthropic.types.messages.batch_create_params import Request
 
     requests_ = []
     for ctx in events:
-        bull = bull_bear_results.get(f"{ctx.event_id}:bull")
-        bear = bull_bear_results.get(f"{ctx.event_id}:bear")
+        bull = bull_bear_results.get(custom_id_de(ctx.event_id, "bull"))
+        bear = bull_bear_results.get(custom_id_de(ctx.event_id, "bear"))
         if bull is None or bear is None:
             logger.warning("Evento %d sin Bull o Bear completo, se omite del Judge", ctx.event_id)
             continue
@@ -186,7 +252,7 @@ def build_judge_batch(events: list[EventContext], bull_bear_results: dict[str, d
         )
         requests_.append(
             Request(
-                custom_id=f"{ctx.event_id}:judge",
+                custom_id=custom_id_de(ctx.event_id, "judge"),
                 params=MessageCreateParamsNonStreaming(
                     model=config.JUDGE_MODEL,
                     max_tokens=1024,
@@ -221,7 +287,11 @@ def run_batch_and_collect(client, requests_) -> tuple[dict[str, dict], str | Non
     results: dict[str, dict] = {}
     for result in client.messages.batches.results(batch.id):
         if result.result.type != "succeeded":
-            logger.warning("Request %s: %s", result.custom_id, result.result.type)
+            # El MOTIVO del error, no solo "errored": sin él, 595 Judge
+            # fallidos en dos runs no dejaron ni una pista de por qué
+            # (era el minimum/maximum del esquema — ver JUDGE_SCHEMA).
+            detalle = getattr(result.result, "error", None)
+            logger.warning("Request %s: %s%s", result.custom_id, result.result.type, f" — {detalle}" if detalle else "")
             continue
         text = next((b.text for b in result.result.message.content if b.type == "text"), None)
         if text is None:

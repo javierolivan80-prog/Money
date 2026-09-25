@@ -12,12 +12,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from pipeline.tests.fake_batch_api import claves_no_soportadas, validar_requests_como_la_api
+
 from pipeline.analyze.adversarial_analyzer import (
+    BEAR_SCHEMA,
+    BULL_SCHEMA,
+    JUDGE_SCHEMA,
     EventContext,
     build_bull_bear_batch,
     build_judge_batch,
+    custom_id_de,
     get_cached_analysis,
     run_batch_and_collect,
+    validar_salida_judge,
 )
 
 
@@ -39,12 +46,12 @@ def _sample_event(event_id=42):
 def test_build_bull_bear_batch_produces_two_requests_with_distinct_custom_ids_and_schemas():
     requests_ = build_bull_bear_batch([_sample_event()])
     by_id = {r["custom_id"]: r for r in requests_}
-    assert set(by_id.keys()) == {"42:bull", "42:bear"}
+    assert set(by_id.keys()) == {"42_bull", "42_bear"}
 
-    bull_props = by_id["42:bull"]["params"]["output_config"]["format"]["schema"]["properties"]
+    bull_props = by_id["42_bull"]["params"]["output_config"]["format"]["schema"]["properties"]
     assert set(bull_props.keys()) == {"thesis", "upside_drivers", "addressable_market", "comparable_events", "catalysts_forward"}
 
-    bear_props = by_id["42:bear"]["params"]["output_config"]["format"]["schema"]["properties"]
+    bear_props = by_id["42_bear"]["params"]["output_config"]["format"]["schema"]["properties"]
     assert set(bear_props.keys()) == {"counter_thesis", "downside_risks", "valuation_concern", "historical_precedent", "negative_catalysts"}
 
 
@@ -56,8 +63,8 @@ def test_build_bull_bear_batch_uses_haiku_for_both_sides():
 def test_build_judge_batch_uses_sonnet_4_6_explicitly():
     events = [_sample_event()]
     results = {
-        "42:bull": {"thesis": "x", "upside_drivers": ["a"], "addressable_market": "big", "comparable_events": "y", "catalysts_forward": ["c"]},
-        "42:bear": {"counter_thesis": "z", "downside_risks": ["r"], "valuation_concern": "v", "historical_precedent": "h", "negative_catalysts": ["n"]},
+        "42_bull": {"thesis": "x", "upside_drivers": ["a"], "addressable_market": "big", "comparable_events": "y", "catalysts_forward": ["c"]},
+        "42_bear": {"counter_thesis": "z", "downside_risks": ["r"], "valuation_concern": "v", "historical_precedent": "h", "negative_catalysts": ["n"]},
     }
     requests_ = build_judge_batch(events, results)
     assert len(requests_) == 1
@@ -68,15 +75,15 @@ def test_build_judge_batch_uses_sonnet_4_6_explicitly():
 
 def test_build_judge_batch_skips_events_missing_bull_or_bear():
     events = [_sample_event()]
-    incomplete = {"42:bull": {"thesis": "x", "upside_drivers": [], "addressable_market": "", "comparable_events": "", "catalysts_forward": []}}
+    incomplete = {"42_bull": {"thesis": "x", "upside_drivers": [], "addressable_market": "", "comparable_events": "", "catalysts_forward": []}}
     assert build_judge_batch(events, incomplete) == []
 
 
 def test_build_judge_batch_embeds_both_analyses_in_prompt():
     events = [_sample_event()]
     results = {
-        "42:bull": {"thesis": "Guidance raised, momentum strong", "upside_drivers": ["driver1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["cat1"]},
-        "42:bear": {"counter_thesis": "Beat was low quality", "downside_risks": ["risk1"], "valuation_concern": "already priced in", "historical_precedent": "failed before at Y", "negative_catalysts": ["neg1"]},
+        "42_bull": {"thesis": "Guidance raised, momentum strong", "upside_drivers": ["driver1"], "addressable_market": "big TAM", "comparable_events": "similar to X", "catalysts_forward": ["cat1"]},
+        "42_bear": {"counter_thesis": "Beat was low quality", "downside_risks": ["risk1"], "valuation_concern": "already priced in", "historical_precedent": "failed before at Y", "negative_catalysts": ["neg1"]},
     }
     requests_ = build_judge_batch(events, results)
     prompt = requests_[0]["params"]["messages"][0]["content"]
@@ -106,6 +113,7 @@ class _FakeBatchesClient:
         self._batch_state = SimpleNamespace(id="batch_test123", processing_status="ended")
 
     def create(self, requests):
+        validar_requests_como_la_api(requests)
         return self._batch_state
 
     def retrieve(self, batch_id):
@@ -113,17 +121,17 @@ class _FakeBatchesClient:
 
     def results(self, batch_id):
         return [
-            _mock_batch_result("1:judge", "succeeded", {"net_conviction": 0.6, "confidence_in_conviction": 75, "key_uncertainty": "u", "overriding_concern": "c"}),
-            _mock_batch_result("2:judge", "errored"),
+            _mock_batch_result(custom_id_de(1, "judge"), "succeeded", {"net_conviction": 0.6, "confidence_in_conviction": 75, "key_uncertainty": "u", "overriding_concern": "c"}),
+            _mock_batch_result(custom_id_de(2, "judge"), "errored"),
         ]
 
 
 def test_run_batch_and_collect_skips_errored_results():
     client = SimpleNamespace(messages=SimpleNamespace(batches=_FakeBatchesClient()))
-    results, batch_id = run_batch_and_collect(client, requests_=[{"custom_id": "1:judge"}])
+    results, batch_id = run_batch_and_collect(client, requests_=[{"custom_id": custom_id_de(1, "judge")}])
     assert batch_id == "batch_test123"
-    assert set(results.keys()) == {"1:judge"}
-    assert results["1:judge"]["net_conviction"] == 0.6
+    assert set(results.keys()) == {custom_id_de(1, "judge")}
+    assert results[custom_id_de(1, "judge")]["net_conviction"] == 0.6
 
 
 def test_run_batch_and_collect_sin_requests_no_crea_batch():
@@ -221,3 +229,129 @@ class TestCacheAgainstRealPostgres:
         assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 1, 2)) is not None
         assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2024, 4, 1)) is None
         assert get_cached_analysis(self.conn, "ACME", "8K_2.02_EARNINGS", date(2023, 12, 31)) is None
+
+
+# --- custom_id contra el patrón real de la Batch API ------------------------
+#
+# BUG REAL (2026-09-15, run 34960903955): custom_id se construía con dos
+# puntos ("{event_id}:bull"). La Batch API de Anthropic exige
+# '^[a-zA-Z0-9_-]{1,64}$', que NO admite dos puntos, y rechazaba el batch
+# ENTERO con 400 antes de procesar una sola request — no había forma de
+# verlo sin llamar de verdad a la API, porque nada en el SDK ni en el tipado
+# de Request valida el patrón en el cliente.
+import re
+
+_PATRON_CUSTOM_ID_ANTHROPIC = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+@pytest.mark.parametrize("side", ["bull", "bear", "judge"])
+def test_custom_id_cumple_el_patron_que_exige_la_batch_api(side):
+    assert _PATRON_CUSTOM_ID_ANTHROPIC.match(custom_id_de(42, side))
+
+
+def test_todos_los_custom_id_de_un_batch_real_cumplen_el_patron():
+    """Sobre los requests que construye de verdad build_bull_bear_batch y
+    build_judge_batch, no sobre la función aislada — para que un cambio que
+    vuelva a usar f-strings a mano en vez de custom_id_de se detecte aquí."""
+    evento = _sample_event(event_id=12345)
+    for r in build_bull_bear_batch([evento]):
+        assert _PATRON_CUSTOM_ID_ANTHROPIC.match(r["custom_id"]), r["custom_id"]
+
+    resultados = {
+        custom_id_de(evento.event_id, "bull"): {
+            "thesis": "x", "upside_drivers": ["a"], "addressable_market": "big",
+            "comparable_events": "y", "catalysts_forward": ["c"],
+        },
+        custom_id_de(evento.event_id, "bear"): {
+            "counter_thesis": "z", "downside_risks": ["r"], "valuation_concern": "v",
+            "historical_precedent": "h", "negative_catalysts": ["n"],
+        },
+    }
+    for r in build_judge_batch([evento], resultados):
+        assert _PATRON_CUSTOM_ID_ANTHROPIC.match(r["custom_id"]), r["custom_id"]
+
+
+def test_custom_id_no_lleva_dos_puntos():
+    """El carácter concreto que causó el 400 en producción."""
+    assert ":" not in custom_id_de(42, "bull")
+
+
+def test_custom_id_es_reversible_por_sufijo():
+    """El resto del código lo consume con .get(custom_id_de(event_id, side)) o
+    .endswith(f"_{side}") — tiene que poder distinguirse el lado sin
+    ambigüedad para un event_id numérico."""
+    assert custom_id_de(42, "bull") != custom_id_de(42, "bear")
+    assert custom_id_de(42, "bull").endswith("_bull")
+    assert not custom_id_de(423, "bull").endswith("_3_bull")  # sin arrastrar dígitos del id
+
+
+# --- P0-2: esquemas compatibles con structured outputs y rango del Judge ---
+
+
+@pytest.mark.parametrize("nombre,schema", [("BULL", BULL_SCHEMA), ("BEAR", BEAR_SCHEMA), ("JUDGE", JUDGE_SCHEMA)])
+def test_ningun_esquema_usa_restricciones_que_structured_outputs_no_admite(nombre, schema):
+    """Regresión del fallo real: minimum/maximum en JUDGE_SCHEMA hacía que la
+    API marcase `errored` el 100% de las requests del Judge (595 en dos runs)."""
+    assert claves_no_soportadas(schema) == [], f"{nombre}_SCHEMA"
+
+
+def test_el_batch_del_judge_real_pasa_el_validador_de_la_api():
+    evento = _sample_event(event_id=7)
+    resultados = {
+        custom_id_de(7, "bull"): {"thesis": "x", "upside_drivers": ["a"], "addressable_market": "b",
+                                  "comparable_events": "c", "catalysts_forward": ["d"]},
+        custom_id_de(7, "bear"): {"counter_thesis": "x", "downside_risks": ["a"], "valuation_concern": "b",
+                                  "historical_precedent": "c", "negative_catalysts": ["d"]},
+    }
+    validar_requests_como_la_api(build_bull_bear_batch([evento]))
+    validar_requests_como_la_api(build_judge_batch([evento], resultados))
+
+
+@pytest.mark.parametrize("conviction,confidence", [(0.6, 80), (-1, 0), (1, 100), (-1.0, 100.0), (0, 50)])
+def test_validar_salida_judge_acepta_el_rango_incluidos_los_extremos(conviction, confidence):
+    out = validar_salida_judge({"net_conviction": conviction, "confidence_in_conviction": confidence,
+                                "key_uncertainty": "u", "overriding_concern": "c"})
+    assert out is not None
+    assert out["net_conviction"] == float(conviction)
+    assert out["confidence_in_conviction"] == float(confidence)
+    assert isinstance(out["net_conviction"], float)
+    assert out["key_uncertainty"] == "u"  # el resto de campos se conserva
+
+
+@pytest.mark.parametrize("conviction,confidence", [
+    (1.01, 50), (-1.5, 50), (3, 50),          # conviction fuera de [-1, 1]
+    (0.5, -0.1), (0.5, 100.5), (0.5, 150),    # confidence fuera de [0, 100]
+    (float("nan"), 50), (0.5, float("nan")),  # NaN
+    (True, 50), (0.5, False),                 # bool (subclase de int en Python)
+    ("0.5", 50), (0.5, "80"), (None, 50),     # no numéricos
+])
+def test_validar_salida_judge_rechaza_fuera_de_rango_sin_recortar(conviction, confidence):
+    assert validar_salida_judge({"net_conviction": conviction, "confidence_in_conviction": confidence}) is None
+
+
+def test_validar_salida_judge_rechaza_campos_ausentes_o_no_dict():
+    assert validar_salida_judge({"net_conviction": 0.5}) is None
+    assert validar_salida_judge({"confidence_in_conviction": 50}) is None
+    assert validar_salida_judge(None) is None
+    assert validar_salida_judge([0.5, 50]) is None
+
+
+def test_run_batch_and_collect_registra_el_motivo_del_error(caplog):
+    """Sin el motivo, los 595 Judge fallidos no dejaron ninguna pista."""
+    error = SimpleNamespace(type="invalid_request", message="schema: 'minimum' is not supported")
+    resultado = SimpleNamespace(custom_id=custom_id_de(1, "judge"), result=SimpleNamespace(type="errored", error=error))
+
+    class _Cliente:
+        def create(self, requests):
+            return SimpleNamespace(id="b", processing_status="ended")
+
+        def retrieve(self, batch_id):
+            return SimpleNamespace(id=batch_id, processing_status="ended")
+
+        def results(self, batch_id):
+            return [resultado]
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=_Cliente()))
+    with caplog.at_level("WARNING"):
+        run_batch_and_collect(client, [{"custom_id": custom_id_de(1, "judge")}])
+    assert "minimum" in caplog.text

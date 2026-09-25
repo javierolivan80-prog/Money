@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from pipeline.tests.fake_batch_api import validar_requests_como_la_api
+
 from pipeline.ingest.universe_maintenance import is_investable
 
 pytestmark_db = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="DATABASE_URL no definida")
@@ -168,7 +170,7 @@ class _ClienteQueFalla:
         self.creates = 0
 
     def create(self, requests):
-        assert requests, "batch vacío: la API real lo rechaza con un 400"
+        validar_requests_como_la_api(requests)
         self.creates += 1
         self.sizes = getattr(self, "sizes", []) + [len(requests)]
         self._reqs = requests
@@ -191,7 +193,8 @@ def test_run_pipeline_no_entra_en_bucle_si_la_ia_falla(conn):
     client = SimpleNamespace(messages=SimpleNamespace(batches=fake))
 
     # Antes: bucle infinito. Ahora: un intento por evento y por corrida.
-    assert run_pipeline(conn, client, max_chunks=10) == 1
+    procesados, _ = run_pipeline(conn, client, max_chunks=10)
+    assert procesados == 1
     assert fake.creates == 1  # un batch Bull/Bear; sin Bull/Bear no hay batch de Judge, y se acabó
 
 
@@ -205,7 +208,8 @@ def test_run_pipeline_respeta_el_tope_de_eventos(conn):
     fake = _ClienteQueFalla()
     client = SimpleNamespace(messages=SimpleNamespace(batches=fake))
 
-    assert run_pipeline(conn, client, max_events=3) == 3
+    procesados, conn = run_pipeline(conn, client, max_events=3)
+    assert procesados == 3
     assert fake.sizes == [6]  # 3 eventos x (bull + bear), y ni uno más
     assert len(fetch_events_needing_analysis(conn, 50)) == 7  # nada guardado: siguen en cola
 

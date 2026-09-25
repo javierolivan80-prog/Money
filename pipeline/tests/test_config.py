@@ -27,16 +27,30 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _restaurar_config():
-    """Deja pipeline.config como estaba al acabar cada test.
+def _restaurar_config_de_verdad_al_acabar():
+    """Sin esto, pipeline.config queda CONTAMINADO para el resto de la sesión
+    de pytest.
 
-    monkeypatch restaura os.environ, pero NO el módulo: tras un reload con
-    DATABASE_URL borrada, config.DATABASE_URL se quedaba en el default
-    'postgresql://localhost:5432/money_poc' para TODOS los tests que venían
-    después — y los 60+ tests de integración con Postgres fallaban con
-    'fe_sendauth: no password supplied'. Eso tumbó el job `test` de cada run
-    del Nightly Pipeline desde que se añadió este fichero, y con él todo el
-    pipeline (ingest_and_analyze depende de `test`)."""
+    BUG REAL (2026-09-15, run 34959268239, reproducido IDÉNTICO dos veces —
+    391 passed, 2 failed, 63 errors, los mismos 63 en el mismo orden ambas
+    veces: no era una casualidad de infraestructura, era determinista).
+
+    _recargar_config hace importlib.reload(config) para leer una variable de
+    entorno sucia. monkeypatch deshace la variable de entorno al acabar el
+    test, pero el MÓDULO ya reimportado se queda con el DATABASE_URL de la
+    prueba (o sin él) — Python no vuelve a leer el entorno solo porque el
+    test terminó. Cualquier test que corriera después, en el mismo proceso de
+    pytest, heredaba ese config.DATABASE_URL roto. Alfabéticamente eso es
+    justo test_populate_car_results.py en adelante, que es exactamente el
+    bloque que reventó con "fe_sendauth: no password supplied" — el fallback
+    sin usuario ni contraseña de config.py, no la base de datos real de CI.
+
+    Como fixture autouse se registra ANTES que el monkeypatch de cada test
+    (pytest instancia los autouse antes que los pedidos explícitamente), así
+    que su desmontaje corre DESPUÉS: cuando esto se ejecuta, monkeypatch ya
+    restauró el entorno real, y recargar aquí devuelve pipeline.config a
+    lo que tenía que ser.
+    """
     yield
     from pipeline import config
     importlib.reload(config)
@@ -111,3 +125,41 @@ def test_limpiar_en_config_no_basta_si_el_cliente_no_lo_usa():
 def test_cualquier_espacio_en_blanco_envolvente_se_quita(monkeypatch, sucio):
     config = _recargar_config(monkeypatch, ANTHROPIC_API_KEY=sucio)
     assert config.ANTHROPIC_API_KEY == "sk-ant-x"
+
+
+# --- El módulo no puede quedar contaminado para el resto de la sesión ------
+#
+# Captado ANTES de que ningún test de este fichero toque el entorno: es el
+# valor de referencia contra el que se compara al final. Si esto se ejecutara
+# después de un test sucio sin el fixture de arriba, ya estaría contaminado
+# también — por eso se congela aquí, a nivel de módulo, en el momento de
+# la recolección.
+_DATABASE_URL_ORIGINAL = __import__("os").environ.get("DATABASE_URL")
+_ANTHROPIC_API_KEY_ORIGINAL = __import__("os").environ.get("ANTHROPIC_API_KEY")
+
+
+def test_el_modulo_queda_limpio_para_el_resto_de_la_sesion(monkeypatch):
+    """EL test que habría cazado el bug de producción: tras ensuciar y
+    recargar pipeline.config en un test, el módulo tiene que volver a reflejar
+    el entorno REAL antes de que corra el siguiente test — no el de la
+    prueba. Sin el fixture de arriba, esta aserción falla porque config sigue
+    con el DATABASE_URL sucio del test anterior."""
+    _recargar_config(monkeypatch, DATABASE_URL="postgresql://sucio\n", ANTHROPIC_API_KEY="sk-sucio\n")
+    from pipeline import config
+    assert config.DATABASE_URL == "postgresql://sucio"  # dentro del test, se aplica
+
+    # Aquí ya no estamos monkeypatcheando nada: esto simula "el siguiente
+    # test" mirando el módulo después de que este termine. No se puede
+    # comprobar el desmontaje del fixture desde dentro del propio test que lo
+    # dispara, así que lo fija test_el_siguiente_test_no_hereda_nada, que
+    # corre después en el mismo fichero.
+
+
+def test_el_siguiente_test_no_hereda_nada():
+    """Corre DESPUÉS del test de arriba en el mismo proceso de pytest. Si el
+    fixture de restauración no funcionara, este test vería el DATABASE_URL
+    sucio ('postgresql://sucio') en vez del real del entorno — exactamente lo
+    que le pasó a test_populate_car_results.py y compañía en producción."""
+    from pipeline import config
+    assert config.DATABASE_URL == (_DATABASE_URL_ORIGINAL.strip() if _DATABASE_URL_ORIGINAL else "postgresql://localhost:5432/money_poc")
+    assert config.ANTHROPIC_API_KEY == (_ANTHROPIC_API_KEY_ORIGINAL.strip() if _ANTHROPIC_API_KEY_ORIGINAL else None)
